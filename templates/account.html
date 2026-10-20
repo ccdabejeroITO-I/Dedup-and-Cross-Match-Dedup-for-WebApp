@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>My Account · CrossMatch v{{ app_version }}</title><link rel="stylesheet" href="/static/css/app.css?v={{ app_version }}"></head>
+<body data-page="account" data-username="{{ username }}">
+<header class="topbar"><a class="brand" href="/">CM <span>CrossMatch Browser <small>v{{ app_version }}</small></span></a>
+<nav aria-label="Main navigation"><span class="nav-person" id="nav-display-name">{{ display_name }}</span>
+<form class="nav-workspace-form" action="/" method="get"><button class="nav-page-button" type="submit">CrossMatch workspace</button></form>
+<form class="nav-workspace-form" action="/account" method="get"><button class="nav-page-button" type="submit" aria-current="page">My Account</button></form>
+<form class="nav-workspace-form {{ admin_class }}" action="/admin" method="get"><button class="nav-page-button" type="submit">Administration</button></form>
+<button id="logout" class="ghost" type="button">Sign out</button></nav></header>
+<main class="account-shell account-shell-wide">
+<div class="page-heading"><div><p class="eyebrow">ACCOUNT SETTINGS</p><h1>My Account</h1><p class="muted">Manage your profile, password and signed-in devices. User creation and system logs are available under Administration for administrators only.</p></div><span class="status-pill status-green">Active account</span></div>
+<div id="message" class="notice hidden" role="alert"></div>
+<section class="account-summary card" aria-label="Profile overview">
+  <div class="account-avatar" aria-hidden="true" id="account-avatar">CM</div>
+  <div class="account-summary-main"><h2 id="account-name">{{ display_name }}</h2><p class="muted">@<span id="account-username">{{ username }}</span></p></div>
+  <div class="account-stat"><span>Role</span><strong id="account-role">{{ role_label }}</strong></div>
+  <div class="account-stat"><span>Account created</span><strong id="created-at">Loading…</strong></div>
+  <div class="account-stat"><span>Last successful login</span><strong id="last-login">Loading…</strong></div>
+</section>
+<div class="account-grid">
+  <section class="card" id="profile-section"><div class="section-heading"><h2>Personal details</h2><span class="status-pill status-blue">PROFILE</span></div><p class="muted">Your username is fixed to maintain accurate audit records. You may change your displayed name.</p>
+  <form id="profile-form" class="account-form"><label>Username (read-only)<input name="username" value="{{ username }}" readonly autocomplete="username"></label><label>Display name<input id="display-name" name="display_name" value="{{ display_name }}" minlength="2" maxlength="120" required></label><button type="submit">Save display name</button></form></section>
+  <section class="card" id="password-section"><div class="section-heading"><h2>Change password</h2><span class="status-pill status-amber">SECURITY</span></div><p class="muted">Use at least 10 characters. Changing your password signs out every device, including this browser.</p>
+  <form id="my-password-form" class="account-form"><label>Current password<input name="current_password" type="password" autocomplete="current-password" required></label><label>New password<input name="new_password" type="password" minlength="10" maxlength="256" autocomplete="new-password" required></label><label>Confirm new password<input name="confirm_password" type="password" minlength="10" maxlength="256" autocomplete="new-password" required></label><button type="submit">Update password</button></form></section>
+</div>
+<section class="card" id="sessions-section"><div class="section-heading"><div><h2>Signed-in devices</h2><p class="muted account-section-note">See your active CrossMatch login sessions. An expired or revoked session can no longer be used.</p></div><span class="status-pill status-blue" id="sessions-total">Loading…</span></div>
+<div class="account-tools"><button class="secondary" id="refresh-sessions" type="button">Refresh sessions</button><button class="danger-outline secondary" id="logout-others" type="button">Sign out other devices</button></div>
+<div class="table-scroll"><table><thead><tr><th>Device / Browser</th><th>IP address</th><th>Expires</th><th>Session</th></tr></thead><tbody id="sessions-list"><tr><td colspan="4">Loading sessions…</td></tr></tbody></table></div></section>
+<section class="card" id="activity-section"><div class="section-heading"><div><h2>My recent activity</h2><p class="muted account-section-note">Your latest login, account and processing events. Full office-wide logs remain restricted to Administration.</p></div><button class="secondary" id="refresh-activity" type="button">Refresh activity</button></div>
+<div class="table-scroll"><table><thead><tr><th>Date / time</th><th>Action</th><th>Result</th></tr></thead><tbody id="activity-list"><tr><td colspan="3">Loading activity…</td></tr></tbody></table></div></section>
+<div class="account-bottom-actions"><form action="/" method="get"><button type="submit" class="secondary">Back to CrossMatch</button></form><button type="button" id="logout-bottom" class="danger-outline secondary">Sign out</button></div>
+</main><script src="/static/js/account.js?v={{ app_version }}" defer></script></body></html>

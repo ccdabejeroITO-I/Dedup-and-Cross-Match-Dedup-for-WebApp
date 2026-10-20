@@ -1,0 +1,17 @@
+.git
+.venv
+**/__pycache__
+*.pyc
+cache
+database
+certificates
+*.bat
+*.zip
+*.log
+
+# Keep any private local configuration out of the Docker image. Compose uses allowed environment variables.
+.env
+*.db*
+
+# Windows-only helper, never needed inside container
+*.ps1

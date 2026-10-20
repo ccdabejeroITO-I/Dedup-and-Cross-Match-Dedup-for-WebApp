@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ app_title }} · v{{ app_version }}</title><link rel="stylesheet" href="/static/css/app.css?v={{ app_version }}"></head><body data-ui-version="{{ app_version }}" data-page="home" data-username="{{ username }}"><header class="topbar"><a class="brand" href="/">CM <span>CrossMatch Browser <small>v{{ app_version }}</small></span></a><nav aria-label="Main navigation"><span class="nav-person">{{ display_name }}</span><form class="nav-workspace-form" action="/" method="get"><button class="nav-page-button" type="submit" aria-current="page">CrossMatch workspace</button></form><form class="nav-workspace-form" action="/account" method="get"><button class="nav-page-button" type="submit">My Account</button></form><form class="nav-workspace-form {{ admin_class }}" action="/admin" method="get"><button class="nav-page-button" type="submit">Administration</button></form><button id="logout" class="ghost" type="button">Sign out</button></nav></header><main><div class="page-heading"><div><p class="eyebrow">LOCAL DATA PROCESSING</p><h1>Find matching records</h1><p class="muted">One-time browser upload → local processing → Excel/CSV results. No Python installation on the laptop.</p></div><div class="workspace-header-actions"><button id="open-settings-popup" class="secondary" type="button" aria-haspopup="dialog" aria-controls="comparison-settings-editor"><span aria-hidden="true">⚙</span> Comparison settings <small id="settings-current">File A only</small></button><button id="new-session" class="secondary" type="button">New session</button></div></div><div id="message" class="notice hidden" role="alert"></div><fieldset id="workspace"><legend class="sr-only">Matching settings and files</legend><dialog id="comparison-settings-editor" class="cross-editor-dialog comparison-settings-dialog" aria-labelledby="settings-popup-title">
+  <div class="editor-popup-head"><div><p class="editor-popup-eyebrow">PROCESSING SETUP</p><h2 id="settings-popup-title">Comparison Settings</h2><p>Set processing mode, matching options, and age filters before running.</p></div><button type="button" class="secondary editor-popup-x" data-close-editor="comparison-settings-editor" aria-label="Close comparison settings">×</button></div>
+  <div class="editor-popup-body">
+<section class="card settings" aria-label="CrossMatch configuration" id="matching-settings">
+  <div class="section-heading settings-heading">
+    <div><h2>Comparison Settings</h2><p class="muted settings-intro">Configure how records are matched, filtered, and exported.</p></div>
+    <span class="badge settings-build">UI v{{ app_version }}</span>
+  </div>
+  <div class="settings-groups">
+    <div class="settings-group" aria-labelledby="settings-basic-title">
+      <div class="settings-group-heading"><h3 id="settings-basic-title">Basic Settings</h3><p>Choose the comparison type and output.</p></div>
+      <div class="settings-grid settings-grid-basic">
+        <label class="setting-field" for="mode">
+          <span class="setting-field-name">Processing mode</span>
+          <span class="setting-hint">How the files are compared</span>
+          <select id="mode"><option value="file-a">Deduplicate File A</option><option value="cross">Cross Match: File A (Main) vs File B (Master)</option></select>
+        </label>
+        <div class="setting-field" id="tile-profile">
+          <div class="setting-field-heading"><label class="setting-field-name" for="scan-preset">Matching profile</label><span id="profile-status" class="status-pill status-purple" aria-live="polite">Combined recall</span></div>
+          <span class="setting-hint">Depth of record matching</span>
+          <select id="scan-preset"><option value="exhaustive" selected>Comprehensive + Maximum recall (Exact + Fuzzy · all eligible pairs)</option><option value="quick">Quick result (Exact; swaps optional)</option></select>
+        </div>
+        <div class="setting-field" id="tile-export">
+          <div class="setting-field-heading"><label class="setting-field-name" for="export-format">Result format</label><span id="status-export" class="status-pill status-blue" aria-live="polite">CSV ZIP</span></div>
+          <span class="setting-hint">Preferred processing export; both downloads available</span>
+          <select id="export-format"><option value="csv_zip">Fast CSV ZIP (large files)</option><option value="xlsx">Formatted Excel workbook</option></select>
+        </div>
+      </div>
+    </div>
+    <div class="settings-group" aria-labelledby="settings-matching-title">
+      <div class="settings-group-heading"><h3 id="settings-matching-title">Matching Options</h3><p>Adjust name matching without changing other filters.</p></div>
+      <div class="settings-grid settings-grid-matching">
+        <label class="setting-field" for="threshold">
+          <span class="setting-field-name">Overall similarity threshold (%)</span>
+          <span class="setting-hint">Accept overall scores from the chosen % to 100</span>
+          <input id="threshold" type="number" min="80" max="100" value="80">
+        </label>
+        <label class="setting-option" id="tile-fuzzy" for="fuzzy">
+          <span class="setting-field-heading"><span class="setting-field-name">Fuzzy matching</span><span id="status-fuzzy" class="status-pill status-green" aria-live="polite">ON</span></span>
+          <span class="setting-option-check"><input id="fuzzy" type="checkbox" checked><span>Find similar names</span></span>
+        </label>
+        <label class="setting-option" id="tile-swap" for="swap">
+          <span class="setting-field-heading"><span class="setting-field-name">Name swaps</span><span id="status-swap" class="status-pill status-green" aria-live="polite">ON</span></span>
+          <span class="setting-option-check"><input id="swap" type="checkbox" checked><span>Check swapped name fields</span></span>
+        </label>
+      </div>
+      <p id="profile-help" class="profile-guidance" role="status">Combined comprehensive fuzzy matching checks all eligible pairs. Large datasets may take considerably longer.</p>
+    </div>
+    <div class="settings-group" aria-labelledby="settings-age-title">
+      <div class="settings-group-heading"><h3 id="settings-age-title">Age Filter</h3><p>Enter 0 to disable either age limit. Age findings go to Review.</p></div>
+      <div class="settings-grid settings-grid-age">
+        <label class="setting-field" for="min-age">
+          <span class="setting-field-name">Minimum age</span>
+          <span class="setting-hint">0 = no minimum</span>
+          <input id="min-age" type="number" min="0" max="200" value="0">
+        </label>
+        <label class="setting-field" for="max-age">
+          <span class="setting-field-name">Maximum age</span>
+          <span class="setting-hint">0 = no maximum</span>
+          <input id="max-age" type="number" min="0" max="200" value="0">
+        </label>
+      </div>
+    </div>
+  </div>
+  <p class="muted settings-footnote">File A is the main file. File B serves as the reference in Cross Match mode.</p>
+</section>
+  </div>
+  <div class="editor-popup-footer"><span>Settings apply immediately. They are used when you start processing.</span><button type="button" data-close-editor="comparison-settings-editor">Done · close settings</button></div>
+</dialog>
+<section class="card files-workspace" id="files-workspace" aria-labelledby="files-workspace-title">
+  <div class="section-heading files-workspace-heading">
+    <div><h2 id="files-workspace-title">Files for CrossMatch</h2><p id="files-mode-help" class="muted">Upload File A and review its headers for within-file deduplication.</p></div>
+    <span class="badge files-workspace-badge">ONE SECTION · TWO FILES</span>
+  </div>
+  <div class="files-workspace-intro"><strong>File A</strong> is the Main File that receives the final result. <strong>File B</strong> is the Master / Reference file used only for comparison.</div>
+  <div class="files">
+    <section class="file-card file-panel file-panel-main" id="card-a" aria-labelledby="file-a-title">
+      <div class="section-heading file-heading"><h3 id="file-a-title">File A <span class="file-title-sub">— Main File</span></h3><span class="file-role file-role-main">RECORDS TO PROCESS</span></div>
+      <p class="file-purpose"><strong>Main records.</strong> Upload the list CrossMatch will classify into Duplicate Records, Records for Review, or Validated Records.</p>
+      <label class="upload-label" for="file-a">Choose File A (Excel or CSV)<input type="file" id="file-a" accept=".csv,.xlsx,.xlsm"></label>
+      <div class="upload-progress-line"><span class="upload-state" id="upload-state-a" data-state="empty" role="status">Not uploaded</span><button id="retry-a" class="secondary retry-upload hidden" type="button">Retry upload</button></div>
+      <p class="muted upload-file-info" id="info-a">No file uploaded.</p>
+      <div class="hidden file-upload-details" id="details-a">
+        <label>Worksheet<select id="sheet-a" aria-label="File A worksheet"></select></label>
+        <p class="notice" id="warnings-a"></p>
+      </div>
+    </section>
+    <section class="file-card file-panel file-panel-ref" id="card-b" aria-labelledby="file-b-title">
+      <div class="section-heading file-heading"><h3 id="file-b-title">File B <span class="file-title-sub">— Master / Reference</span></h3><span class="file-role file-role-ref">REFERENCE DATA</span></div>
+      <p class="file-purpose"><strong>Reference records.</strong> Upload the master/reference list. Its detected headers become available in the mapping dropdowns below.</p>
+      <label class="upload-label" for="file-b">Choose File B (Excel or CSV)<input type="file" id="file-b" accept=".csv,.xlsx,.xlsm"></label>
+      <div class="upload-progress-line"><span class="upload-state" id="upload-state-b" data-state="empty" role="status">Not uploaded</span><button id="retry-b" class="secondary retry-upload hidden" type="button">Retry upload</button></div>
+      <p class="muted upload-file-info" id="info-b">No file uploaded.</p>
+      <div class="hidden file-upload-details" id="details-b">
+        <label>Worksheet<select id="sheet-b" aria-label="File B worksheet"></select></label>
+        <p class="notice" id="warnings-b"></p>
+      </div>
+    </section>
+  </div>
+  <div id="mapping-workspace" class="mapping-workspace hidden">
+    <div class="mapping-workspace-head"><div><h3>Unified Header Mapping &amp; Rules</h3><p id="mapping-intro">Review identity columns and configure other detected fields in one place.</p></div><div class="unified-quick-actions" aria-label="Mapping and rules tools"><button id="open-mapping-popup" type="button" class="secondary" aria-haspopup="dialog" aria-controls="header-mapping-editor">Edit headers</button><button id="open-conditions-popup" type="button" class="secondary" aria-haspopup="dialog" aria-controls="unified-conditions-editor">Rules &amp; saved setups</button></div></div>
+    <div class="mapping-mode-bar" aria-label="Header mapping mode">
+      <div><strong>Matching scope</strong><small>Automatically follows the Processing mode selected above.</small></div>
+      <div class="mapping-mode-actions">
+        <span id="mapping-scope" class="mapping-mode-button is-active" role="status">Within File A</span>
+      </div>
+    </div>
+    <p id="mapping-review-status" class="mapping-review-status hidden" role="status">Waiting for File A header mapping.</p>
+    <div class="table-scroll unified-decisions-scroller"><table class="mapping unified-decisions" aria-label="Unified header mapping and rules"><thead><tr><th>Field / Purpose</th><th>Detected Header in File A</th><th id="unified-header-b">Detected Header in File B</th><th>Use this field for</th><th>Configure</th></tr></thead><tbody id="unified-decisions-body"></tbody></table></div>
+    <div class="unified-add-field"><label for="unified-add-header">+ Add another detected header</label><div class="unified-add-actions"><select id="unified-add-header"><option value="">Choose a header to add…</option></select><button type="button" id="unified-add-button" class="secondary">+ Add to table</button></div><p class="muted">Only selected optional headers appear here. All original columns stay in your result files.</p></div>
+    <dialog id="header-mapping-editor" class="cross-editor-dialog" aria-labelledby="mapping-popup-title">
+      <div class="editor-popup-head"><div><p class="editor-popup-eyebrow">HEADER MAPPING</p><h2 id="mapping-popup-title">Edit detected meanings and header pairs</h2><p id="mapping-popup-description">Confirm uncertain suggestions here. Original columns stay in the output.</p></div><button type="button" class="secondary editor-popup-x" data-close-editor="header-mapping-editor" aria-label="Close header mapping">×</button></div>
+      <div class="editor-popup-body"><div class="table-scroll"><table class="mapping unified-mapping-table"><thead><tr><th>File A Original Header</th><th>Detected Meaning</th><th id="paired-header-title">Detected Header in File A</th><th>Add Condition</th></tr></thead><tbody id="mapping-a"></tbody></table></div><p id="mapping-editor-empty" class="mapping-editor-empty hidden" role="status">No detected fields in this group. Check the full header mapping.</p></div>
+      <div class="editor-popup-footer"><span>Changes apply immediately to this session.</span><button type="button" data-close-editor="header-mapping-editor">Done · close window</button></div>
+    </dialog>
+    <dialog id="unified-conditions-editor" class="cross-editor-dialog" aria-labelledby="conditions-popup-title">
+      <div class="editor-popup-head"><div><p class="editor-popup-eyebrow">RULE BUILDER</p><h2 id="conditions-popup-title">Configure Conditions &amp; saved rule setups</h2><p>Use the existing condition editor. Save current to store a reusable profile.</p></div><button type="button" class="secondary editor-popup-x" data-close-editor="unified-conditions-editor" aria-label="Close Conditions">×</button></div>
+      <div class="editor-popup-body">
+<section class="rules-card unified-rules-embedded" id="advanced-conditions" aria-label="Advanced Conditions and Rule Builder">
+  <div class="section-heading conditions-header">
+    <div><h2>Advanced Conditions / Rule Builder</h2><p class="muted">Add extra checks after identity matching. These rules classify records but never change your fuzzy-match threshold.</p></div>
+    <label class="inline-toggle conditions-master-toggle"><input type="checkbox" id="conditions-enabled" checked> Conditions ON</label>
+  </div>
+
+  <div class="condition-start-panel" aria-labelledby="condition-start-title">
+    <div class="condition-start-copy"><h3 id="condition-start-title">Add a condition</h3><p id="condition-start-help">File A only: add a check for a field in File A.</p><p id="condition-scope-note">Conditions are kept separately for each processing mode. Only the conditions shown here run.</p></div>
+    <div class="condition-add-actions">
+      <button id="add-condition" class="add-condition-button" type="button" aria-controls="custom-rules"><span id="add-condition-title" class="add-condition-title">+ Check File A</span><span id="add-condition-help" class="add-condition-help">Check a field in File A against text, a number, or a date.</span></button>
+    </div>
+  </div>
+
+  <div class="conditions-quick-guide" aria-label="How custom conditions work">
+    <div><span class="guide-step">1</span><p><strong>Choose records</strong><small id="condition-records-help">File A records only.</small></p></div>
+    <div><span class="guide-step">2</span><p><strong>Choose field(s)</strong><small>Select the column you want the system to check.</small></p></div>
+    <div><span class="guide-step">3</span><p><strong>Set the check</strong><small id="condition-check-help">Check a value, number, date, or blank field in File A.</small></p></div>
+    <div><span class="guide-step">4</span><p><strong>Choose result</strong><small>Validated, Duplicate, or Records for Review.</small></p></div>
+  </div>
+
+  <details class="cross-rule-explainer"><summary>How does File A ↔ File B comparison work?</summary><p>The existing matching engine first finds an accepted File A ↔ File B identity pair. Your condition then compares the two selected fields inside that matched pair. You can optionally require the selected <b>File A field</b> to exactly match an additional value or text. Leave the optional value blank when you only want the A ↔ B field comparison. It does not compare unrelated records. A verified duplicate stays in <b>DUPLICATE RECORDS</b>; a rule can add a review flag when needed.</p></details>
+
+
+  <div class="custom-rules-heading"><div><h3>Your conditions</h3><p id="custom-rule-status" class="muted" role="status" aria-live="polite">No conditions yet. Choose one of the two Add buttons above.</p></div></div>
+  <div id="custom-rules" class="custom-rules"></div>
+
+  <div class="saved-rule-panel">
+    <div class="saved-rule-copy"><h3>Saved rule setup</h3><p>Save a set of conditions so you can reuse it with another upload.</p></div>
+    <div class="profile-actions"><label class="profile-choice">Saved setup<select id="condition-profile"><option value="">Current unsaved setup</option></select></label><button type="button" id="load-profile" class="secondary">Load saved</button><button type="button" id="save-profile">Save current</button><button type="button" id="duplicate-profile" class="secondary">Save a copy</button><button type="button" id="reset-profile" class="secondary">Clear current</button><button type="button" id="delete-profile" class="secondary danger-outline">Delete saved</button></div>
+    <p class="muted saved-rule-note">Saved setups contain rule settings and selected header names only. Beneficiary records are not stored in the account database.</p>
+  </div>
+  </section></div>
+      <div class="editor-popup-footer"><span>Changes apply for this session. Saved profiles require Save current.</span><button type="button" data-close-editor="unified-conditions-editor">Done · close window</button></div>
+  </dialog>
+  </div>
+</section>
+<div class="run-bar"><div class="run-status"><p>Possible matches need review before a beneficiary decision.</p><p id="run-readiness" role="status" class="run-readiness">Upload File A successfully before processing.</p></div><button id="run" type="button" disabled>Start processing</button></div></fieldset><section id="job-panel" class="card hidden" aria-live="polite"><div class="section-heading"><h2 id="job-state">Processing</h2><span id="elapsed" class="muted"></span></div><progress id="job-progress" aria-label="Processing"></progress><p id="job-message"></p><p id="job-stage" class="muted" aria-live="polite"></p><div id="counts" class="counts"></div><p id="counts-status" class="muted" role="status"></p><div id="result-actions" class="result-actions hidden"><a id="download" class="button" href="#">Download Excel (.xlsx)</a><a id="download-csv" class="button secondary" href="#">Download CSV ZIP</a><button id="delete-session" class="secondary" type="button">Delete temporary files</button></div><p id="result-help" class="muted hidden">Download CSV ZIP or Excel (.xlsx) after processing. For Fast CSV ZIP jobs, Excel is created from the finished results when requested; larger files can take longer. The original Excel processing option offers richer formatting. After downloading, use Delete temporary files to erase this session’s uploads, indexes, and exports.</p><details><summary>Processing log</summary><pre id="log"></pre></details></section><footer>Runs locally or on your office server · Uploaded records are temporary and are not entered in the accounts database. Temporary files expire {{ cache_hours }} hours after the last upload or processing activity. Download results before they expire.</footer></main><script src="/static/js/app.js?v={{ app_version }}" defer></script></body></html>

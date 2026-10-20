@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Create account · {{ app_title }} v{{ app_version }}</title>
+  <link rel="stylesheet" href="/static/css/app.css?v={{ app_version }}">
+</head>
+<body data-page="register">
+  <main class="auth-shell">
+    <section class="card auth-card" aria-labelledby="registration-heading">
+      <a class="brand" href="/login">CM <span>CrossMatch Browser <small>v{{ app_version }}</small></span></a>
+      <h1 id="registration-heading">Create your account</h1>
+      <p class="muted">Request access to CrossMatch. Your account can be used only after an administrator approves it.</p>
+
+      <ol class="registration-steps" aria-label="Account approval steps">
+        <li><span class="registration-step-number" aria-hidden="true">1</span><span>Enter details</span></li>
+        <li><span class="registration-step-number" aria-hidden="true">2</span><span>Admin reviews</span></li>
+        <li><span class="registration-step-number" aria-hidden="true">3</span><span>Sign in</span></li>
+      </ol>
+
+      <div id="message" class="notice hidden" role="alert" aria-live="polite"></div>
+      <form id="register-form">
+        <label for="register-username">Username</label>
+        <input id="register-username" name="username" required minlength="3" maxlength="80"
+               pattern="[A-Za-z0-9][A-Za-z0-9_.@-]{2,79}" autocomplete="username"
+               autocapitalize="none" spellcheck="false" placeholder="e.g. officer01"
+               aria-describedby="username-hint">
+        <small class="field-hint" id="username-hint">3–80 characters. Letters, numbers, dots, underscores, @ and hyphens.</small>
+
+        <label for="register-display-name">Full name</label>
+        <input id="register-display-name" name="display_name" required minlength="2" maxlength="120"
+               autocomplete="name" placeholder="Your full name">
+
+        <label for="register-password">Password</label>
+        <div class="auth-password-input">
+          <input id="register-password" name="password" type="password" required minlength="10"
+                 maxlength="256" autocomplete="new-password" aria-describedby="password-hint">
+          <button class="password-visibility" type="button" data-password-target="register-password"
+                  aria-label="Show password" aria-pressed="false">Show</button>
+        </div>
+        <small class="field-hint" id="password-hint">Use at least 10 characters. Avoid passwords you use elsewhere.</small>
+
+        <label for="register-confirm-password">Confirm password</label>
+        <div class="auth-password-input">
+          <input id="register-confirm-password" name="confirm_password" type="password" required minlength="10"
+                 maxlength="256" autocomplete="new-password" aria-describedby="password-match-message">
+          <button class="password-visibility" type="button" data-password-target="register-confirm-password"
+                  aria-label="Show confirmed password" aria-pressed="false">Show</button>
+        </div>
+        <small class="field-hint" id="password-match-message" aria-live="polite"></small>
+
+        <button class="registration-submit" type="submit">Submit account request</button>
+      </form>
+
+      <section class="registration-success hidden" id="registration-success" aria-labelledby="success-heading" tabindex="-1">
+        <span class="registration-success-symbol" aria-hidden="true">✓</span>
+        <h2 id="success-heading">Request received</h2>
+        <p id="success-message">If eligible, your account will become available after administrator approval.</p>
+        <p class="muted">Contact your system administrator to check the status of your request. No automatic email notification is sent.</p>
+        <a class="button secondary" href="/login">Return to sign in</a>
+      </section>
+      <div class="auth-alt"><a href="/login">Already have an account? Sign in</a></div>
+    </section>
+  </main>
+  <script src="/static/js/register.js?v={{ app_version }}" defer></script>
+</body>
+</html>

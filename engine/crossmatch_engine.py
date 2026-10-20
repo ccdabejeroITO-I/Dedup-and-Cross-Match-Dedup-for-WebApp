@@ -1,0 +1,8773 @@
+# -*- coding: utf-8 -*-
+"""
+CrossMatch Dedup 500K-1M Fuzzy + Swap Optimized Engine
+================================
+A standalone, disk-backed de-duplication engine designed for 500,000 to
+1,000,000 File A rows without loading the full source workbook into RAM.
+
+v6.31 clean-header UI + consistency hardening
+- Conservative UTF-8/cp1252/latin1 mojibake repair before name normalization.
+- Cross Match core identity policy is semantically synchronized across File A/B.
+- Exact semantic Name + exact DOB is promoted to TRUE before fuzzy-only labeling.
+- Column-level MDY/DMY inference uses only consistent unambiguous evidence.
+- 10K bounded streaming chunks, disk indexes, Zip64, and no-loss export retained.
+
+Core guarantees
+- TRUE_DUPLICATE: complete exact normalized Name + Birth matching.
+- TRUE_SWAP_DUPLICATE: complete order-independent Name + Birth matching.
+- Fast dual 64-bit hashes are always verified against the full normalized key
+  before a record is classified as an exact or swap duplicate.
+- Cross mode checks File A against File B only. File B is reference/master.
+- FUZZY_DUPLICATE and FUZZY_SWAP_DUPLICATE are enabled by default as 80-100% duplicate outputs. They use
+  independent name-block evidence and RapidFuzz scoring with no birth-year gate. Structured fuzzy matching requires First+Last anchors; Middle Name is optional only when missing and becomes a hard compatibility gate when both sides contain data.
+  Birthdate may support, differ, be far apart, or be missing when Review settings allow it. Fuzzy output is not proof
+  of human identity and must be reviewed before action.
+- Results are streamed into one Excel workbook with separate Summary, Run Info,
+  Validated, Duplicate, and Review sheets. Large result sheets are automatically
+  split only when Excel's 1,048,576-row worksheet limit would be exceeded.
+
+Hardware strategy
+- Pandas/NumPy vectorization for chunk normalization and hashing.
+- RapidFuzz native C++ scoring using all useful available CPU workers for the current batch load.
+- Memory-mapped numeric arrays instead of full in-memory DataFrames.
+- SQLite disk indexes for full-string verification, fuzzy candidate blocking,
+  and File B reference lookup.
+- Adaptive chunk sizes based on available RAM.
+
+Recommended packages
+    pip install pandas numpy rapidfuzz openpyxl xlsxwriter psutil
+
+Headless web integration: imported by services/worker.py.
+Matching, mapping, normalization, and export functions retain the supplied v6.31 code.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import gc
+import hashlib
+import json
+import math
+import os
+import queue
+import re
+import sqlite3
+import sys
+import tempfile
+import threading
+import time
+import unicodedata
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, Sequence
+
+import numpy as np
+import pandas as pd
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+try:
+    from rapidfuzz import fuzz, process
+    from rapidfuzz.distance import JaroWinkler, OSA
+except Exception as exc:  # pragma: no cover
+    raise RuntimeError("RapidFuzz is required. Install it with: pip install rapidfuzz") from exc
+
+APP_TITLE = "Local De-duplication 500K-1M - Fuzzy + Swap Optimized"
+ENGINE_VERSION = "NameCoreFuzzy-6.32.23-maximum-recall"
+MODE_FILE_A = "Only File A (within-file dedup)"
+MODE_CROSS = "Cross Match A vs File B"
+
+TYPE_CLEAN = 0
+TYPE_TRUE = 1
+TYPE_FUZZY = 2
+TYPE_TRUE_SWAP = 3
+TYPE_FUZZY_SWAP = 4
+TYPE_FINDING = 5
+
+TYPE_LABELS = {
+    TYPE_CLEAN: "CLEAN",
+    TYPE_TRUE: "TRUE_DUPLICATE",
+    TYPE_FUZZY: "FUZZY_DUPLICATE",
+    TYPE_TRUE_SWAP: "TRUE_SWAP_DUPLICATE",
+    TYPE_FUZZY_SWAP: "FUZZY_SWAP_DUPLICATE",
+    TYPE_FINDING: "FINDING",
+}
+
+# Finding bit mask
+F_MISSING_NAME = 1
+F_MISSING_FIRST = 2
+F_MISSING_LAST = 4
+F_MISSING_BIRTH = 8
+F_INVALID_BIRTH = 16
+F_AMBIGUOUS_BIRTH = 32
+F_FUTURE_BIRTH = 64
+F_TOO_OLD = 128
+F_MISSING_MIDDLE = 256
+F_MISSING_SUFFIX = 512
+F_MISSING_BIRTH_MONTH = 1024
+F_MISSING_BIRTH_DAY = 2048
+F_MISSING_BIRTH_YEAR = 4096
+F_MISSING_EXACT = 8192
+F_UNDER_AGE = 16384
+F_AMBIGUOUS_MATCH = 32768
+
+# Missing-only findings can still participate in deduplication when enough
+# other identity data is available. Invalid/future/age findings remain blocking.
+F_DEDUP_ALLOWED_MISSING = (
+    F_MISSING_NAME | F_MISSING_FIRST | F_MISSING_LAST | F_MISSING_BIRTH
+    | F_MISSING_MIDDLE | F_MISSING_SUFFIX | F_MISSING_BIRTH_MONTH
+    | F_MISSING_BIRTH_DAY | F_MISSING_BIRTH_YEAR | F_MISSING_EXACT
+)
+F_DEDUP_BLOCKING_FINDING = (
+    F_INVALID_BIRTH | F_AMBIGUOUS_BIRTH | F_FUTURE_BIRTH | F_TOO_OLD | F_UNDER_AGE | F_AMBIGUOUS_MATCH
+)
+
+MISSING_TOKENS = {"", "nan", "none", "null", "na", "n/a", "not applicable", "not_applicable", "-", "--", "0", "0.0", "0.00", "0.000"}
+# Rows generated by formulas/templates sometimes contain only numeric zeroes.
+# They are placeholders, not beneficiary records. A zero in an identity field
+# must never create a TRUE/FUZZY duplicate key.
+ROW_PLACEHOLDER_TOKENS = MISSING_TOKENS | {"-0", "-0.0", "-0.00"}
+HASH_KEY_1 = "0123456789abcdef"
+HASH_KEY_2 = "fedcba9876543210"
+DEFAULT_CHUNK_ROWS = 100_000
+MIN_CHUNK_ROWS = 10_000
+MAX_CHUNK_ROWS = 10_000
+DEFAULT_MEMORY_PERCENT = 80
+DEFAULT_BLOCK_LIMIT = 500
+DEFAULT_CANDIDATES = 28
+DEFAULT_BIRTH_YEAR_WINDOW = 2
+MAX_CPU_WORKERS = 0  # 0 = all CPU cores available to the process/container
+FUZZY_PROCESS_THRESHOLD = 1  # use multiprocessing whenever more than one CPU is available
+FUZZY_SCORE_BATCH_ROWS = 8_000
+FUZZY_PROGRESS_ROWS = 100_000
+HOT_BLOCK_SWITCH_PAIRS = 64
+HOT_BLOCK_CDIST_CHUNK = 512
+HOT_DENSE_MIDDLE_PAIR_SWITCH = HOT_BLOCK_SWITCH_PAIRS  # switch search axis as soon as Middle itself becomes a hot relation
+WEAK_MATRIX_FETCH_ROWS = 50_000
+WEAK_MATRIX_MEMMAP_SWITCH_BYTES = 128 * 1024 * 1024
+SCORE_DECISION_CACHE_MAX = 1_000_000  # larger speed cache only; never limits candidate coverage
+
+# Large-output safety. Excel itself has a hard limit of 1,048,576 rows per
+# worksheet. CrossMatch never truncates rows: it automatically continues a
+# category on additional worksheets. Zip64 removes the classic 4 GiB ZIP
+# container ceiling for very large .xlsx exports.
+EXCEL_MAX_ROWS = 1_048_576
+EXCEL_MAX_DATA_ROWS = EXCEL_MAX_ROWS - 1
+LARGE_EXPORT_ROW_THRESHOLD = 500_000
+DUPLICATE_SPOOL_FETCH_BATCH = 800
+LARGE_FUZZY_WEAK_RESCUE_THRESHOLD = 50_000
+
+# Accuracy-first component gates. Middle Name is optional only when absent.
+# If both records contain a middle name, it becomes identity evidence and must
+# pass this stricter full-word similarity floor. Initial-to-full-name matches
+# are handled separately and remain compatible.
+MIDDLE_FULLWORD_MIN_SIMILARITY = 80.0
+MIDDLE_INITIAL_COMPATIBILITY_SCORE = 95.0
+AMBIGUOUS_MATCH_MARGIN = 1.5
+AMBIGUOUS_MATCH_MAX_TIES = 1
+MIN_DEDUP_FUZZY_THRESHOLD = 80
+
+# -----------------------------------------------------------------------------
+# MAXIMUM COVERAGE MODE
+# -----------------------------------------------------------------------------
+# Accuracy/coverage limits are removed from fuzzy candidate generation:
+# - no per-row fuzzy candidate cap
+# - no fuzzy-block row-count cap
+# - no birth-year window gate
+# - no automatic large-file fuzzy skip
+# - all available CPU cores may be used
+# Finding/Review still evaluates every selected row. RAM-aware chunking remains
+# only to prevent the operating system from becoming unusable; it does not
+# reduce matching coverage.
+MAXIMUM_COVERAGE_MODE = False
+
+LogFn = Callable[[str], None]
+
+
+def _now() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def default_log(message: str) -> None:
+    print(f"[{_now()}] {message}", flush=True)
+
+
+def strip_accents(text: Any) -> str:
+    value = unicodedata.normalize("NFKD", str(text or ""))
+    return "".join(ch for ch in value if not unicodedata.combining(ch))
+
+
+# Common mojibake markers produced when UTF-8 bytes are decoded as Windows-1252
+# or Latin-1.  Repair is deliberately conservative: a round-trip candidate is
+# accepted only when it reduces suspicious marker characters.
+_MOJIBAKE_MARKER_RE = re.compile(r"[\u00c2\u00c3\u00e2\u00f0\ufffd]")
+
+def _mojibake_penalty(value: str) -> int:
+    text = str(value or "")
+    return (
+        8 * len(_MOJIBAKE_MARKER_RE.findall(text))
+        + 20 * text.count("\ufffd")
+        + 3 * sum(1 for ch in text if 0x80 <= ord(ch) <= 0x9F)
+    )
+
+def repair_common_mojibake_text(value: Any) -> str:
+    """Repair typical UTF-8-as-cp1252/latin1 corruption without guessing broadly.
+
+    Example: ``TIÃ‘OSO`` -> ``TIÑOSO``.  Legitimate Unicode is returned
+    unchanged unless a reversible byte round-trip clearly reduces mojibake
+    markers.
+    """
+    text = str(value or "")
+    if not text or not _MOJIBAKE_MARKER_RE.search(text):
+        return text
+    best = text
+    best_penalty = _mojibake_penalty(text)
+    for source_encoding in ("cp1252", "latin1"):
+        try:
+            candidate = text.encode(source_encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        penalty = _mojibake_penalty(candidate)
+        # Require a strict improvement; never replace clean-looking source text
+        # with a merely different Unicode spelling.
+        if penalty < best_penalty:
+            best = candidate
+            best_penalty = penalty
+    return best
+
+def repair_common_mojibake_series(series: pd.Series) -> pd.Series:
+    text = series.astype("string").fillna("")
+    try:
+        mask = text.str.contains(_MOJIBAKE_MARKER_RE, regex=True, na=False)
+    except Exception:
+        mask = text.map(lambda x: bool(_MOJIBAKE_MARKER_RE.search(str(x or ""))))
+    if bool(mask.any()):
+        repaired = text.loc[mask].map(repair_common_mojibake_text)
+        text = text.copy()
+        text.loc[mask] = repaired
+    return text
+
+
+def simple_header_key(value: Any) -> str:
+    value = strip_accents(str(value or "")).casefold()
+    return re.sub(r"[^a-z0-9]+", "", value)
+
+
+HEADER_ALIASES: dict[str, str] = {
+    # full name
+    "name": "full_name", "fullname": "full_name", "completename": "full_name",
+    "concatenate": "full_name", "clientname": "full_name", "beneficiary": "full_name",
+    "beneficiaryname": "full_name", "participantname": "full_name", "membername": "full_name",
+    "recipientname": "full_name", "applicantname": "full_name", "pangalan": "full_name",
+    "buongpangalan": "full_name", "kumpletongpangalan": "full_name", "ngalan": "full_name",
+    # names
+    "firstname": "first", "first": "first", "fname": "first", "firstnm": "first", "given": "first", "givenname": "first", "forename": "first",
+    "unangpangalan": "first", "fristname": "first", "firtsname": "first",
+    "middlename": "middle", "middle": "middle", "mname": "middle", "middleinitial": "middle", "mi": "middle",
+    "gitnangpangalan": "middle", "midlename": "middle",
+    "lastname": "last", "last": "last", "lname": "last", "lastnm": "last", "surname": "last", "familyname": "last",
+    "apelyido": "last", "apelido": "last", "sirname": "last", "surnam": "last",
+    "suffix": "suffix", "extension": "suffix", "extensionname": "suffix", "nameext": "suffix", "nameextn": "suffix", "suffixname": "suffix",
+    "nameextension": "suffix", "extname": "suffix", "ext": "suffix",
+    # birth
+    "birthdate": "birthdate", "dateofbirth": "birthdate", "dob": "birthdate",
+    "birthday": "birthdate", "bdate": "birthdate", "brithdate": "birthdate",
+    "birthdat": "birthdate", "petsangkapanganakan": "birthdate",
+    "birthmonth": "birth_month", "monthofbirth": "birth_month", "bmonth": "birth_month",
+    "birthmm": "birth_month", "buwan": "birth_month", "monthmm": "birth_month",
+    "dayofbirth": "birth_day", "bday": "birth_day", "birthdd": "birth_day",
+    "birthdayday": "birth_day", "araw": "birth_day", "daydd": "birth_day",
+    "birthyear": "birth_year", "yearofbirth": "birth_year", "byear": "birth_year",
+    "birthyyyy": "birth_year", "taon": "birth_year", "taonngkapanganakan": "birth_year",
+    "yyyy": "birth_year", "birthyr": "birth_year",
+    # fallback exact data
+    "contactnumber": "exact", "contactno": "exact", "mobilenumber": "exact",
+    "cellphonenumber": "exact", "phonenumber": "exact", "license": "exact",
+    "licenseno": "exact", "licensenumber": "exact", "driverslicense": "exact",
+    "driverslicenseno": "exact", "dlno": "exact", "id": "exact", "idno": "exact",
+    "idnumber": "exact", "clientid": "exact", "memberid": "exact", "participantid": "exact",
+    "beneficiaryid": "exact", "recordid": "exact", "referenceid": "exact",
+    "householdid": "exact", "hhid": "exact", "householdnumber": "exact",
+    # explicitly ignored locations
+    "province": "ignore", "provincename": "ignore", "region": "ignore", "regionname": "ignore",
+    "city": "ignore", "cityname": "ignore", "municipality": "ignore",
+    "municipalityname": "ignore", "barangay": "ignore", "barangayname": "ignore", "brgy": "ignore",
+}
+
+# Extended aliases retained from the proven classic engine. These broaden
+# automatic header detection without changing matching rules.
+HEADER_ALIASES.update({'arawngkapanganakan': 'birth_day',
+ 'bdateofbirth': 'birthdate',
+ 'bdaydate': 'birthdate',
+ 'bdy': 'birth_day',
+ 'beneficiaryfullname': 'full_name',
+ 'benepisyaryo': 'full_name',
+ 'birtdate': 'birthdate',
+ 'birtday': 'birthdate',
+ 'birthdt': 'birthdate',
+ 'birthdte': 'birthdate',
+ 'birthdy': 'birthdate',
+ 'birthdya': 'birth_day',
+ 'birthmnth': 'birth_month',
+ 'bmon': 'birth_month',
+ 'brthday': 'birthdate',
+ 'buwanngkapanganakan': 'birth_month',
+ 'byr': 'birth_year',
+ 'cellno': 'exact',
+ 'cellphone': 'exact',
+ 'cellphoneno': 'exact',
+ 'christianname': 'first',
+ 'citymunicipality': 'ignore',
+ 'clientfullname': 'full_name',
+ 'contact': 'exact',
+ 'contactdetails': 'exact',
+ 'contactnum': 'exact',
+ 'cpno': 'exact',
+ 'cpnumber': 'exact',
+ 'customername': 'full_name',
+ 'datebirth': 'birthdate',
+ 'dd': 'birth_day',
+ 'dlnumber': 'exact',
+ 'driverlicense': 'exact',
+ 'familylastname': 'last',
+ 'firstgivenname': 'first',
+ 'firstnam': 'first',
+ 'firstpangalan': 'first',
+ 'fullnameofbeneficiary': 'full_name',
+ 'givename': 'first',
+ 'givenfirstname': 'first',
+ 'hhno': 'exact',
+ 'hhnumber': 'exact',
+ 'householdno': 'exact',
+ 'hulingpangalan': 'last',
+ 'kapanganakan': 'birthdate',
+ 'lastnamee': 'last',
+ 'licence': 'exact',
+ 'licenceno': 'exact',
+ 'licencenumber': 'exact',
+ 'ltono': 'exact',
+ 'ltonumber': 'exact',
+ 'middlenamee': 'middle',
+ 'middlenm': 'middle',
+ 'minitial': 'middle',
+ 'mm': 'birth_month',
+ 'mmddyyyy': 'birthdate',
+ 'mobile': 'exact',
+ 'mobileno': 'exact',
+ 'nameofapplicant': 'full_name',
+ 'nameofbeneficiary': 'full_name',
+ 'nameofclient': 'full_name',
+ 'nameofparticipant': 'full_name',
+ 'personid': 'exact',
+ 'phoneno': 'exact',
+ 'provincecode': 'ignore',
+ 'refid': 'exact',
+ 'secondname': 'last',
+ 'servedyear': 'exact',
+ 'serveyear': 'exact',
+ 'serviceyear': 'exact',
+ 'slpparticipantid': 'exact',
+ 'telephone': 'exact',
+ 'telephonenumber': 'exact',
+ 'telno': 'exact',
+ 'uid': 'exact',
+ 'yearassisted': 'exact',
+ 'yearavailed': 'exact',
+ 'yearofservice': 'exact',
+ 'yearserve': 'exact',
+ 'yearservecd': 'exact',
+ 'yearserved': 'exact',
+ 'yearyy': 'birth_year',
+ 'yearyyyy': 'birth_year',
+ 'yrbirth': 'birth_year',
+ 'yrserve': 'exact',
+ 'yrserved': 'exact',
+ 'yy': 'birth_year',
+ 'yyyymmdd': 'birthdate'})
+
+MONTH_MAP = {
+    "jan": 1, "january": 1, "enero": 1,
+    "feb": 2, "february": 2, "pebrero": 2,
+    "mar": 3, "march": 3, "marso": 3,
+    "apr": 4, "april": 4, "abril": 4,
+    "may": 5, "mayo": 5,
+    "jun": 6, "june": 6, "hunyo": 6,
+    "jul": 7, "july": 7, "hulyo": 7,
+    "aug": 8, "august": 8, "agosto": 8,
+    "sep": 9, "sept": 9, "september": 9, "setyembre": 9,
+    "oct": 10, "october": 10, "oktober": 10,
+    "nov": 11, "november": 11, "nobyembre": 11,
+    "dec": 12, "december": 12, "disyembre": 12,
+}
+
+
+DEFAULT_REVIEW_FIELDS = [
+    "full_name", "first", "last", "birthdate", "birth_month", "birth_day", "birth_year"
+]
+DEFAULT_DEDUP_FIELDS = [
+    "full_name", "first", "middle", "last", "suffix",
+    "birthdate", "birth_month", "birth_day", "birth_year", "exact_fields"
+]
+
+
+@dataclass
+class ColumnMapping:
+    full_name: str = ""
+    first: str = ""
+    middle: str = ""
+    last: str = ""
+    suffix: str = ""
+    birthdate: str = ""
+    birth_month: str = ""
+    birth_day: str = ""
+    birth_year: str = ""
+    exact_fields: list[str] = field(default_factory=list)
+    # Other Exact Data can contain several original headers. Keep independent
+    # checkbox state for each header so Contact Number can be enabled while
+    # HHID or Amount is ignored.
+    exact_review_fields: list[str] = field(default_factory=list)
+    exact_dedup_fields: list[str] = field(default_factory=list)
+    exact_ignored_fields: list[str] = field(default_factory=list)
+    # Any original header can be checked for missing data even when it is not
+    # mapped to a Name/Birth/Exact identity meaning.
+    review_headers: list[str] = field(default_factory=list)
+    # Optional display meaning for original/custom headers. This allows every
+    # detected source header to appear as a Meaning choice without forcing it
+    # into one of the built-in identity categories.
+    custom_meanings: dict[str, str] = field(default_factory=dict)
+    review_fields: list[str] = field(default_factory=lambda: list(DEFAULT_REVIEW_FIELDS))
+    dedup_fields: list[str] = field(default_factory=lambda: list(DEFAULT_DEDUP_FIELDS))
+    # Explicit Ignore state. Earlier builds inferred Ignore from an empty header,
+    # which allowed Review + Dedup + Ignore to appear checked at the same time.
+    ignored_fields: list[str] = field(default_factory=list)
+
+    def exact_ignore_enabled(self, header: str) -> bool:
+        return str(header or "") in set(self.exact_ignored_fields or [])
+
+    def exact_review_enabled(self, header: str) -> bool:
+        header = str(header or "")
+        return bool(header and not self.exact_ignore_enabled(header) and header in set(self.exact_review_fields or []))
+
+    def exact_dedup_enabled(self, header: str) -> bool:
+        header = str(header or "")
+        return bool(header and not self.exact_ignore_enabled(header) and header in set(self.exact_dedup_fields or []))
+
+    def set_exact_ignore(self, header: str, enabled: bool) -> None:
+        header = str(header or "").strip()
+        if not header:
+            return
+        values = list(dict.fromkeys(self.exact_ignored_fields or []))
+        if enabled and header not in values:
+            values.append(header)
+        if not enabled:
+            values = [x for x in values if x != header]
+        self.exact_ignored_fields = values
+        if enabled:
+            self.exact_review_fields = [x for x in (self.exact_review_fields or []) if x != header]
+            self.exact_dedup_fields = [x for x in (self.exact_dedup_fields or []) if x != header]
+
+    def set_exact_review(self, header: str, enabled: bool) -> None:
+        header = str(header or "").strip()
+        if not header:
+            return
+        values = list(dict.fromkeys(self.exact_review_fields or []))
+        if enabled and header not in values:
+            values.append(header)
+        if not enabled:
+            values = [x for x in values if x != header]
+        self.exact_review_fields = values
+        if enabled:
+            self.set_exact_ignore(header, False)
+
+    def set_exact_dedup(self, header: str, enabled: bool) -> None:
+        header = str(header or "").strip()
+        if not header:
+            return
+        values = list(dict.fromkeys(self.exact_dedup_fields or []))
+        if enabled and header not in values:
+            values.append(header)
+        if not enabled:
+            values = [x for x in values if x != header]
+        self.exact_dedup_fields = values
+        if enabled:
+            self.set_exact_ignore(header, False)
+
+    def active_exact_dedup_fields(self) -> list[str]:
+        available = set(self.exact_fields or [])
+        return [x for x in (self.exact_dedup_fields or []) if x in available and not self.exact_ignore_enabled(x)]
+
+    def active_exact_review_fields(self) -> list[str]:
+        available = set(self.exact_fields or [])
+        return [x for x in (self.exact_review_fields or []) if x in available and not self.exact_ignore_enabled(x)]
+
+    def header_review_enabled(self, header: str) -> bool:
+        header = str(header or "").strip()
+        return bool(header and header in set(self.review_headers or []))
+
+    def set_header_review(self, header: str, enabled: bool) -> None:
+        header = str(header or "").strip()
+        if not header:
+            return
+        values = list(dict.fromkeys(self.review_headers or []))
+        if enabled and header not in values:
+            values.append(header)
+        if not enabled:
+            values = [x for x in values if x != header]
+        self.review_headers = values
+
+    def custom_meaning(self, header: str) -> str:
+        header = str(header or "").strip()
+        if not header:
+            return ""
+        value = str((self.custom_meanings or {}).get(header, "") or "").strip()
+        return value
+
+    def set_custom_meaning(self, header: str, meaning: str) -> None:
+        header = str(header or "").strip()
+        meaning = str(meaning or "").strip()
+        if not header:
+            return
+        values = dict(self.custom_meanings or {})
+        if meaning and meaning != "Not Used":
+            values[header] = meaning
+        else:
+            values.pop(header, None)
+        self.custom_meanings = values
+
+    def ignore_enabled(self, key: str) -> bool:
+        return key in set(self.ignored_fields or [])
+
+    def review_enabled(self, key: str) -> bool:
+        return (not self.ignore_enabled(key)) and key in set(self.review_fields or [])
+
+    def dedup_enabled(self, key: str) -> bool:
+        return (not self.ignore_enabled(key)) and key in set(self.dedup_fields or [])
+
+    def set_ignore(self, key: str, enabled: bool) -> None:
+        ignored = list(dict.fromkeys(self.ignored_fields or []))
+        if enabled and key not in ignored:
+            ignored.append(key)
+        if not enabled:
+            ignored = [x for x in ignored if x != key]
+        self.ignored_fields = ignored
+        if enabled:
+            # Ignore is mutually exclusive with Review and Find Duplicates.
+            self.review_fields = [x for x in (self.review_fields or []) if x != key]
+            self.dedup_fields = [x for x in (self.dedup_fields or []) if x != key]
+
+    def set_review(self, key: str, enabled: bool) -> None:
+        values = list(dict.fromkeys(self.review_fields or []))
+        if enabled and key not in values:
+            values.append(key)
+        if not enabled:
+            values = [x for x in values if x != key]
+        self.review_fields = values
+        if enabled:
+            self.set_ignore(key, False)
+
+    def set_dedup(self, key: str, enabled: bool) -> None:
+        values = list(dict.fromkeys(self.dedup_fields or []))
+        if enabled and key not in values:
+            values.append(key)
+        if not enabled:
+            values = [x for x in values if x != key]
+        self.dedup_fields = values
+        if enabled:
+            self.set_ignore(key, False)
+
+    def normalize_flags(self) -> None:
+        valid = set(DEFAULT_DEDUP_FIELDS)
+        self.review_fields = list(dict.fromkeys(x for x in (self.review_fields or []) if x in valid))
+        self.dedup_fields = list(dict.fromkeys(x for x in (self.dedup_fields or []) if x in valid))
+        self.ignored_fields = list(dict.fromkeys(x for x in (self.ignored_fields or []) if x in valid))
+        ignored = set(self.ignored_fields)
+        self.review_fields = [x for x in self.review_fields if x not in ignored]
+        self.dedup_fields = [x for x in self.dedup_fields if x not in ignored]
+        self.review_headers = list(dict.fromkeys(str(x).strip() for x in (self.review_headers or []) if str(x).strip()))
+        if not isinstance(self.custom_meanings, dict):
+            self.custom_meanings = {}
+        else:
+            self.custom_meanings = {
+                str(k).strip(): str(v).strip()
+                for k, v in self.custom_meanings.items()
+                if str(k).strip() and str(v).strip() and str(v).strip() != "Not Used"
+            }
+        exact_available = list(dict.fromkeys(self.exact_fields or []))
+        exact_set = set(exact_available)
+        self.exact_review_fields = list(dict.fromkeys(x for x in (self.exact_review_fields or []) if x in exact_set))
+        self.exact_dedup_fields = list(dict.fromkeys(x for x in (self.exact_dedup_fields or []) if x in exact_set))
+        self.exact_ignored_fields = list(dict.fromkeys(x for x in (self.exact_ignored_fields or []) if x in exact_set))
+        exact_ignored = set(self.exact_ignored_fields)
+        self.exact_review_fields = [x for x in self.exact_review_fields if x not in exact_ignored]
+        self.exact_dedup_fields = [x for x in self.exact_dedup_fields if x not in exact_ignored]
+        # Keep the old semantic flags synchronized for backward compatibility.
+        self.set_review("exact_fields", bool(self.exact_review_fields))
+        self.set_dedup("exact_fields", bool(self.exact_dedup_fields))
+        if exact_available and len(exact_ignored) == len(exact_available):
+            self.set_ignore("exact_fields", True)
+        elif exact_available:
+            self.set_ignore("exact_fields", False)
+
+    def has_name(self) -> bool:
+        return bool(
+            (self.full_name and self.dedup_enabled("full_name"))
+            or (self.first and self.dedup_enabled("first"))
+            or (self.last and self.dedup_enabled("last"))
+            or (self.middle and self.dedup_enabled("middle"))
+            or (self.suffix and self.dedup_enabled("suffix"))
+        )
+
+    def has_birth(self) -> bool:
+        if self.birthdate and self.dedup_enabled("birthdate"):
+            return True
+        return bool(
+            self.birth_month and self.birth_day and self.birth_year
+            and self.dedup_enabled("birth_month")
+            and self.dedup_enabled("birth_day")
+            and self.dedup_enabled("birth_year")
+        )
+
+    def has_exact(self) -> bool:
+        return bool(self.active_exact_dedup_fields())
+
+    def to_json(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "ColumnMapping":
+        allowed = {f.name for f in cls.__dataclass_fields__.values()}
+        values = {k: v for k, v in data.items() if k in allowed}
+        if not isinstance(values.get("exact_fields", []), list):
+            values["exact_fields"] = []
+        for list_name in ("exact_review_fields", "exact_dedup_fields", "exact_ignored_fields", "review_headers"):
+            if list_name in values and not isinstance(values.get(list_name), list):
+                values[list_name] = []
+        if "custom_meanings" in values and not isinstance(values.get("custom_meanings"), dict):
+            values["custom_meanings"] = {}
+        # Old templates stored one checkbox state for all exact headers. Convert
+        # that state into per-header lists once.
+        if "exact_dedup_fields" not in values:
+            values["exact_dedup_fields"] = list(values.get("exact_fields", [])) if "exact_fields" in set(values.get("dedup_fields", [])) else []
+        if "exact_review_fields" not in values:
+            values["exact_review_fields"] = list(values.get("exact_fields", [])) if "exact_fields" in set(values.get("review_fields", [])) else []
+        if "exact_ignored_fields" not in values:
+            values["exact_ignored_fields"] = list(values.get("exact_fields", [])) if "exact_fields" in set(values.get("ignored_fields", [])) else []
+        if "review_fields" in values and not isinstance(values.get("review_fields"), list):
+            values.pop("review_fields", None)
+        if "dedup_fields" in values and not isinstance(values.get("dedup_fields"), list):
+            values.pop("dedup_fields", None)
+        if "ignored_fields" in values and not isinstance(values.get("ignored_fields"), list):
+            values.pop("ignored_fields", None)
+        obj = cls(**values)
+        obj.normalize_flags()
+        return obj
+
+
+@dataclass
+class ScaleOptions:
+    mode: str = MODE_FILE_A
+    exhaustive: bool = False
+    fuzzy: bool = True
+    enable_swap: bool = True
+    fuzzy_threshold: int = 80
+    cpu_workers: int = 0
+    memory_limit_percent: int = DEFAULT_MEMORY_PERCENT
+    chunk_rows: int = 0
+    fuzzy_block_limit: int = 0  # 0 = unlimited; dense ambiguity is handled by indexed/hot-block logic
+    fuzzy_max_candidates: int = -1  # <=0 = unlimited candidate scoring
+    fuzzy_birth_year_window: int = -1  # <0 = no DOB year gate; DOB remains supporting evidence
+    min_age: int = 0
+    max_age: int = 0
+    output_folder: str = ""
+    output_file: str = ""
+    export_format: str = "xlsx"  # xlsx or csv_zip (fast direct CSV output)
+    keep_temp: bool = False
+    # Optional display-only source labels used when the web condition builder
+    # creates filtered temporary files. These never affect matching.
+    source_a_label: str = ""
+    source_b_label: str = ""
+    # Filled internally after Cross Match mapping preflight. Exported to RUN_INFO
+    # so a result workbook records whether the two sides were auto-synchronized.
+    cross_mapping_notes: str = ""
+    advanced_conditions: dict[str, Any] | None = None  # Web-only post-match rule plan
+    enrichment_path: str = ""
+
+    def workers(self) -> int:
+        cores = max(1, int(os.cpu_count() or 4))
+        if self.cpu_workers > 0:
+            # Never create more workers than the machine can actually schedule.
+            # "MAX" means all available hardware, not thousands of oversubscribed
+            # processes from an accidental textbox/CLI value.
+            return max(1, min(cores, int(self.cpu_workers)))
+        return cores
+
+
+@dataclass
+class InputPlan:
+    path: Path
+    sheet: str | None
+    header_row: int
+    headers: list[str]
+    csv_sep: str = ","
+    csv_encoding: str = "utf-8-sig"
+    # Populated only after a verified, short-lived fast Excel conversion.
+    accelerated_csv: Path | None = None
+
+
+@dataclass
+class StagedFile:
+    side: str
+    raw_csv: Path
+    rows: int
+    headers: list[str]
+    db_path: Path
+    hash_dir: Path
+    mapping: ColumnMapping
+    source_plan: InputPlan
+    raw_is_source: bool = False
+
+    def array_path(self, name: str) -> Path:
+        return self.hash_dir / f"{self.side}_{name}.bin"
+
+    def memmap(self, name: str, dtype: Any, mode: str = "r+") -> np.memmap:
+        return np.memmap(self.array_path(name), dtype=dtype, mode=mode, shape=(self.rows,))
+
+
+def dedupe_headers(headers: Sequence[Any]) -> list[str]:
+    seen: dict[str, int] = {}
+    result: list[str] = []
+    for i, value in enumerate(headers, start=1):
+        name = str(value if value is not None else "").strip()
+        if not name or name.casefold().startswith("unnamed:"):
+            name = f"Column {i}"
+        base = name
+        key = base.casefold()
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            name = f"{base}_{seen[key]}"
+        result.append(name)
+    return result
+
+
+def guess_semantic(header: str) -> str:
+    raw = strip_accents(str(header or "")).casefold().strip()
+    key = simple_header_key(header)
+
+    # Explicit split DOB component words.
+    if re.search(r"\bbirth[\s_./\-]+month\b", raw):
+        return "birth_month"
+    if re.search(r"\bbirth[\s_./\-]+year\b", raw):
+        return "birth_year"
+    if re.search(r"\bbirth[\s_./\-]+day\b", raw):
+        return "birth_day"
+
+    if key in HEADER_ALIASES:
+        return HEADER_ALIASES[key]
+
+    if "birth" in key and "month" in key:
+        return "birth_month"
+    if "birth" in key and "year" in key:
+        return "birth_year"
+    if key in {"dobmonth", "dobmm", "monthdob"}:
+        return "birth_month"
+    if key in {"dobyear", "dobyyyy", "yeardob"}:
+        return "birth_year"
+    if key in {"dobday", "dobdd", "daydob", "birthdayday", "dayofbirth", "birthdd", "bday"}:
+        return "birth_day"
+
+    # Full-date labels with format hints must stay full dates.
+    if (
+        key.startswith("birthdate")
+        or key.startswith("dateofbirth")
+        or key.startswith("dob")
+        or key == "birthday"
+        or (
+            key.startswith("birthday")
+            and not any(x in key for x in ("month", "year"))
+            and key not in {"birthdayday"}
+        )
+    ):
+        return "birthdate"
+
+    if "birth" in key and key.endswith("yyyy"):
+        return "birth_year"
+    if "birth" in key and (key.endswith("day") or key.endswith("dd")):
+        return "birth_day"
+    if "birth" in key and ("date" in key or "dob" in key):
+        return "birthdate"
+    if "first" in key and "name" in key:
+        return "first"
+    if "middle" in key and ("name" in key or "initial" in key):
+        return "middle"
+    if ("last" in key or "sur" in key or "family" in key) and "name" in key:
+        return "last"
+    if "suffix" in key or "extension" in key:
+        return "suffix"
+    if "name" in key and not any(
+        x in key for x in (
+            "province", "region", "city", "municipality", "barangay", "username",
+            "street", "subdivision", "village", "sitio", "purok", "address",
+            "validator", "processor", "company", "father", "mother", "spouse",
+        )
+    ):
+        return "full_name"
+    if any(x in key for x in ("contact", "mobile", "phone", "license", "licence")):
+        return "exact"
+    if key.endswith("id") or key.endswith("number") or key.endswith("no"):
+        return "exact"
+    return "ignore"
+
+
+def _smart_default_review_fields(mapping: ColumnMapping) -> list[str]:
+    """Choose safe default Review fields without requiring duplicate representations.
+
+    Full Name and split First/Last are alternative name representations.
+    Birthdate and split Month/Day/Year are alternative birth representations.
+    Middle Name and Suffix remain optional by default.
+    """
+    fields: list[str] = []
+    # Include available alternative paths. build_keys() treats them as OR paths,
+    # not as a requirement that both representations must be populated.
+    if mapping.full_name:
+        fields.append("full_name")
+    if mapping.first:
+        fields.append("first")
+    if mapping.last:
+        fields.append("last")
+
+    if mapping.birthdate:
+        fields.append("birthdate")
+    if mapping.birth_month and mapping.birth_day and mapping.birth_year:
+        fields.extend(["birth_month", "birth_day", "birth_year"])
+    return list(dict.fromkeys(fields))
+
+
+def _repair_legacy_review_policy(mapping: ColumnMapping) -> ColumnMapping:
+    """Migrate only the old all-fields Review default.
+
+    An explicitly empty review_fields list means the user unchecked every
+    Review checkbox and must be preserved. Earlier builds treated an empty list
+    as a legacy template and silently re-enabled Review fields during processing.
+    """
+    current = set(mapping.review_fields or [])
+    legacy = set(DEFAULT_REVIEW_FIELDS)
+    if current == legacy:
+        mapping.review_fields = _smart_default_review_fields(mapping)
+    return mapping
+
+
+def _repair_birth_date_as_day_context(mapping: ColumnMapping, headers: Sequence[str]) -> ColumnMapping:
+    """Repair government templates where `BIRTH DATE` means day-of-month.
+
+    If separate Birth Month and Birth Year columns exist, a header written as
+    `BIRTH DATE` is overwhelmingly likely to be the day component rather than
+    a second complete date. This prevents silent Name-only TRUE_DUPLICATE keys
+    when the day column was left unmapped.
+    """
+    if not (mapping.birth_month and mapping.birth_year) or mapping.birth_day:
+        return mapping
+    candidate = ""
+    for header in headers:
+        raw = strip_accents(str(header or "")).casefold().strip()
+        # Government sheets commonly use either BIRTH DAY or BIRTH DATE for
+        # the day-of-month when separate BIRTH MONTH and BIRTH YEAR exist.
+        if re.fullmatch(r"birth[\s_./\-]+(?:day|date)", raw):
+            candidate = str(header)
+            break
+    if not candidate:
+        return mapping
+
+    # If an older saved template interpreted this as a complete Birthdate or
+    # custom Other Exact Data, move it back to the real Birth Day semantic.
+    if mapping.birthdate == candidate:
+        mapping.birthdate = ""
+        mapping.set_review("birthdate", False)
+        mapping.set_dedup("birthdate", False)
+        mapping.set_ignore("birthdate", True)
+    if candidate in set(mapping.exact_fields or []):
+        mapping.exact_fields = [x for x in mapping.exact_fields if x != candidate]
+        mapping.exact_review_fields = [x for x in mapping.exact_review_fields if x != candidate]
+        mapping.exact_dedup_fields = [x for x in mapping.exact_dedup_fields if x != candidate]
+        mapping.exact_ignored_fields = [x for x in mapping.exact_ignored_fields if x != candidate]
+        mapping.review_headers = [x for x in (mapping.review_headers or []) if x != candidate]
+        mapping.set_custom_meaning(candidate, "")
+    mapping.birth_day = candidate
+    mapping.set_ignore("birth_day", False)
+    # Follow the user's neighboring Month/Year checkbox intent.
+    if mapping.dedup_enabled("birth_month") or mapping.dedup_enabled("birth_year"):
+        mapping.set_dedup("birth_day", True)
+    if mapping.review_enabled("birth_month") or mapping.review_enabled("birth_year"):
+        mapping.set_review("birth_day", True)
+    return mapping
+
+
+def auto_mapping(headers: Sequence[str]) -> ColumnMapping:
+    found: dict[str, list[str]] = {}
+    for header in headers:
+        found.setdefault(guess_semantic(header), []).append(header)
+    mapping = ColumnMapping()
+    for semantic in ("full_name", "first", "middle", "last", "suffix", "birthdate", "birth_month", "birth_day", "birth_year"):
+        values = found.get(semantic, [])
+        if values:
+            setattr(mapping, semantic, values[0])
+    mapping.exact_fields = found.get("exact", [])[:4]
+    mapping.exact_dedup_fields = list(mapping.exact_fields)
+    mapping.exact_review_fields = []
+    mapping.exact_ignored_fields = []
+    # Only detected/mapped fields start enabled. Earlier builds inherited the
+    # dataclass's all-fields Dedup default, so an unmapped row could display a
+    # checked box that appeared impossible to turn off.
+    mapped_dedup: list[str] = []
+    for semantic in ("full_name", "first", "middle", "last", "suffix", "birthdate", "birth_month", "birth_day", "birth_year"):
+        if getattr(mapping, semantic):
+            mapped_dedup.append(semantic)
+    if mapping.exact_fields:
+        mapped_dedup.append("exact_fields")
+    mapping.dedup_fields = mapped_dedup
+    # Review one usable representation, not every alternative representation.
+    mapping.review_fields = _smart_default_review_fields(mapping)
+    mapped_keys = set(mapped_dedup)
+    mapping.ignored_fields = [key for key in DEFAULT_DEDUP_FIELDS if key not in mapped_keys]
+    mapping.normalize_flags()
+    # Do not infer a day component from header context alone: upload detection
+    # checks sample values, and user-selected mappings must remain authoritative.
+    # Rebuild safe default Review fields after contextual Birth Day repair.
+    mapping.review_fields = _smart_default_review_fields(mapping)
+    mapping.normalize_flags()
+    mapping = _repair_core_identity_mapping(mapping, headers)
+    mapping.normalize_flags()
+    return mapping
+
+
+def _repair_core_identity_mapping(mapping: ColumnMapping, headers: Sequence[str], confirmed: dict[str, str] | None = None, *, allow_fallback: bool = True) -> ColumnMapping:
+    """Repair stale/wrong identities without erasing explicitly confirmed headers."""
+    confirmed = confirmed if isinstance(confirmed, dict) else {}
+    headers = [str(h) for h in headers]
+    header_set = set(headers)
+    core = (
+        "full_name", "first", "middle", "last", "suffix",
+        "birthdate", "birth_month", "birth_day", "birth_year",
+    )
+
+    # Lexical meaning is a fallback only; never reinterpret a Full Birthdate
+    # as a day component merely because Month and Year columns also exist.
+    def contextual_semantic(header: str) -> str:
+        return guess_semantic(header)
+
+    # A user-confirmed physical column belongs to only that meaning. Never
+    # re-add it via lexical guessing under a different name/DOB semantic.
+    reserved = {str(header): semantic for semantic, header in confirmed.items()
+                if semantic in core and str(header) in header_set}
+    found: dict[str, list[str]] = {key: [] for key in core}
+    for header in headers:
+        semantic = contextual_semantic(header)
+        if semantic in found and reserved.get(header, semantic) == semantic:
+            found[semantic].append(header)
+
+    def remove_exact(header: str) -> tuple[bool, bool]:
+        review = header in set(mapping.exact_review_fields or []) or header in set(mapping.review_headers or [])
+        dedup = header in set(mapping.exact_dedup_fields or [])
+        mapping.exact_fields = [x for x in (mapping.exact_fields or []) if x != header]
+        mapping.exact_review_fields = [x for x in (mapping.exact_review_fields or []) if x != header]
+        mapping.exact_dedup_fields = [x for x in (mapping.exact_dedup_fields or []) if x != header]
+        mapping.exact_ignored_fields = [x for x in (mapping.exact_ignored_fields or []) if x != header]
+        mapping.review_headers = [x for x in (mapping.review_headers or []) if x != header]
+        mapping.set_custom_meaning(header, "")
+        return review, dedup
+
+    for semantic in core:
+        current = str(getattr(mapping, semantic, "") or "").strip()
+        # User-confirmed mappings from Review Header Mapping are authoritative
+        # when a physical header is unknown to the legacy lexical detector.
+        # Reject only a clear conflicting identity meaning (e.g. surname
+        # selected as first name). Otherwise fuzzy-accepted headers such as
+        # "First Nmae" would be silently discarded during processing.
+        valid_current = bool(current and current in header_set and (contextual_semantic(current) in (semantic, "ignore") or confirmed.get(semantic) == current))
+        candidate = current if valid_current else (found[semantic][0] if allow_fallback and found[semantic] else "")
+
+        old_review = mapping.review_enabled(semantic)
+        old_dedup = mapping.dedup_enabled(semantic)
+        transferred_review = False
+        transferred_dedup = False
+
+        if candidate:
+            transferred_review, transferred_dedup = remove_exact(candidate)
+
+        setattr(mapping, semantic, candidate)
+
+        if candidate:
+            mapping.set_ignore(semantic, False)
+            mapping.set_review(semantic, old_review or transferred_review)
+            mapping.set_dedup(semantic, old_dedup or transferred_dedup)
+        else:
+            mapping.set_review(semantic, False)
+            mapping.set_dedup(semantic, False)
+            mapping.set_ignore(semantic, True)
+
+    # Structured names are authoritative when First + Last exist.
+    # Full Name cannot compensate for a bad First/Middle/Last/Suffix.
+    if mapping.first and mapping.last:
+        mapping.set_dedup("first", True)
+        mapping.set_dedup("last", True)
+        if mapping.middle:
+            mapping.set_dedup("middle", True)
+        if mapping.suffix:
+            mapping.set_dedup("suffix", True)
+        mapping.set_dedup("full_name", False)
+        mapping.set_review("full_name", False)
+        mapping.set_ignore("full_name", True)
+
+    # Restore a complete split-birth path if an old template put Birth Year
+    # under custom/exact data while Month and Day were already selected.
+    split = ("birth_month", "birth_day", "birth_year")
+    if all(getattr(mapping, key) for key in split):
+        selected = sum(1 for key in split if mapping.dedup_enabled(key))
+        if selected >= 2:
+            for key in split:
+                mapping.set_dedup(key, True)
+                mapping.set_ignore(key, False)
+
+    mapping.normalize_flags()
+    return mapping
+
+
+def header_schema_signature(headers: Sequence[str]) -> list[str]:
+    """Stable schema fingerprint used to prevent stale saved mappings."""
+    return sorted(simple_header_key(h) for h in headers if simple_header_key(h))
+
+
+def mapped_semantic_for_header(mapping: ColumnMapping, header: str) -> str | None:
+    header = str(header or "").strip()
+    if not header:
+        return None
+    for key in (
+        "full_name", "first", "middle", "last", "suffix",
+        "birthdate", "birth_month", "birth_day", "birth_year",
+    ):
+        if str(getattr(mapping, key, "") or "").strip() == header:
+            return key
+    if header in set(mapping.exact_fields or []):
+        return "exact_fields"
+    return None
+
+
+def cross_header_role(header: str) -> str:
+    """Return a more specific UI pairing role than generic exact/ignore."""
+    raw = strip_accents(str(header or "")).casefold().strip()
+    key = simple_header_key(header)
+    semantic = guess_semantic(header)
+    if semantic not in {"exact", "ignore"}:
+        return semantic
+
+    # Locations
+    if "province" in key:
+        return "province"
+    if "region" in key:
+        return "region"
+    if "barangay" in key or key.startswith("brgy"):
+        return "barangay"
+    if any(x in key for x in ("city", "municipality", "lgu")):
+        return "city_municipality"
+
+    # Common government/program fields
+    if any(x in key for x in ("contact", "mobile", "cellphone", "phone", "cpno", "cpnumber")):
+        return "contact"
+    if any(x in key for x in ("license", "licence", "driverslicense", "dlnumber", "dlno")):
+        return "license"
+    if "payroll" in key:
+        return "payroll"
+    if key in {"sex", "gender"} or "gender" in key:
+        return "sex"
+    if "civilstatus" in key or "maritalstatus" in key:
+        return "civil_status"
+    if key == "age" or key.endswith("age"):
+        return "age"
+    if key in {"seq", "sequence", "sequenceno", "sequencenumber"}:
+        return "sequence"
+
+    return key or raw
+
+
+def suggest_cross_header_pairs(
+    headers_a: Sequence[str],
+    headers_b: Sequence[str],
+    mapping_a: ColumnMapping,
+    mapping_b: ColumnMapping,
+) -> dict[str, str]:
+    """Pair File A and File B headers by semantic meaning, not list position."""
+    import difflib
+
+    scored: list[tuple[float, int, int, str, str]] = []
+    for ia, ha in enumerate(headers_a):
+        sa = mapped_semantic_for_header(mapping_a, ha)
+        role_a = cross_header_role(ha)
+        custom_a = simple_header_key(mapping_a.custom_meaning(ha))
+        key_a = simple_header_key(ha)
+
+        for ib, hb in enumerate(headers_b):
+            sb = mapped_semantic_for_header(mapping_b, hb)
+            role_b = cross_header_role(hb)
+            custom_b = simple_header_key(mapping_b.custom_meaning(hb))
+            key_b = simple_header_key(hb)
+            score = 0.0
+
+            # Explicit core semantic mapping is the strongest signal.
+            if sa and sb and sa == sb and sa != "exact_fields":
+                score = 120.0
+
+            # Exact normalized header match.
+            if key_a and key_a == key_b:
+                score = max(score, 115.0)
+
+            # Specific role match: province/province, city/municipality,
+            # contact/contact, license/license, etc.
+            if role_a and role_a == role_b:
+                score = max(score, 100.0)
+
+            # Dynamic/custom Meaning match.
+            if custom_a and custom_b and custom_a == custom_b:
+                score = max(score, 108.0)
+
+            # Exact-data headers should never be paired merely by their list
+            # position. They need the same role/meaning/header.
+            if score <= 0.0:
+                continue
+
+            # Small lexical tie-breaker. This favors city/municipality -> city
+            # over lgu -> city when only one File B city column exists.
+            ratio = difflib.SequenceMatcher(None, key_a, key_b).ratio() if key_a and key_b else 0.0
+            score += ratio * 5.0
+            scored.append((score, -ia, -ib, str(ha), str(hb)))
+
+    pairs: dict[str, str] = {}
+    used_a: set[str] = set()
+    used_b: set[str] = set()
+    for _score, _ia, _ib, ha, hb in sorted(scored, reverse=True):
+        if ha in used_a or hb in used_b:
+            continue
+        pairs[ha] = hb
+        used_a.add(ha)
+        used_b.add(hb)
+    return pairs
+
+
+def saved_schema_matches(payload: dict[str, Any], side: str, headers: Sequence[str]) -> bool:
+    """Only reuse a saved mapping when it belongs to the same header schema."""
+    saved = payload.get(f"header_schema_{side}")
+    if not isinstance(saved, list) or not saved:
+        return False
+    current = header_schema_signature(headers)
+    return [str(x) for x in saved] == current
+
+
+def load_mapping(path: str | os.PathLike[str] | None, headers: Sequence[str]) -> ColumnMapping:
+    if not path:
+        return auto_mapping(headers)
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    mapping = ColumnMapping.from_json(data)
+    header_set = set(headers)
+    for field_name in ("full_name", "first", "middle", "last", "suffix", "birthdate", "birth_month", "birth_day", "birth_year"):
+        value = getattr(mapping, field_name)
+        if value and value not in header_set:
+            raise ValueError(f"Mapped column {value!r} was not found in the input headers.")
+    mapping.exact_fields = [x for x in mapping.exact_fields if x in header_set]
+    mapping.exact_review_fields = [x for x in mapping.exact_review_fields if x in header_set]
+    mapping.exact_dedup_fields = [x for x in mapping.exact_dedup_fields if x in header_set]
+    mapping.exact_ignored_fields = [x for x in mapping.exact_ignored_fields if x in header_set]
+    mapping.review_fields = [x for x in mapping.review_fields if x in DEFAULT_DEDUP_FIELDS]
+    mapping.dedup_fields = [x for x in mapping.dedup_fields if x in DEFAULT_DEDUP_FIELDS]
+    mapping.ignored_fields = [x for x in mapping.ignored_fields if x in DEFAULT_DEDUP_FIELDS]
+    mapping.normalize_flags()
+    mapping = _repair_legacy_review_policy(mapping)
+    # CLI / external mapping JSON must receive the same contextual repair as
+    # the GUI. This fixes saved templates where BIRTH DATE is the day component
+    # beside BIRTH MONTH and BIRTH YEAR.
+    # Do not infer a day component from header context alone: upload detection
+    # checks sample values, and user-selected mappings must remain authoritative.
+    mapping = _repair_core_identity_mapping(mapping, headers, data.get("confirmed_semantics", {}),
+                                            allow_fallback=not bool(data.get("explicit_mapping", False)))
+    mapping.normalize_flags()
+    return mapping
+
+
+def _birth_path_available(mapping: ColumnMapping) -> bool:
+    return bool(mapping.birthdate or (mapping.birth_month and mapping.birth_day and mapping.birth_year))
+
+def _birth_dedup_requested(mapping: ColumnMapping) -> bool:
+    return bool(
+        (mapping.birthdate and mapping.dedup_enabled("birthdate"))
+        or any(
+            getattr(mapping, key) and mapping.dedup_enabled(key)
+            for key in ("birth_month", "birth_day", "birth_year")
+        )
+    )
+
+def _set_complete_birth_dedup(mapping: ColumnMapping, enabled: bool) -> None:
+    if mapping.birthdate:
+        mapping.set_dedup("birthdate", enabled)
+        if enabled:
+            mapping.set_ignore("birthdate", False)
+    split_complete = bool(mapping.birth_month and mapping.birth_day and mapping.birth_year)
+    for key in ("birth_month", "birth_day", "birth_year"):
+        if getattr(mapping, key):
+            # A split DOB is one semantic field. Do not leave Month selected
+            # while Day/Year are disabled.
+            mapping.set_dedup(key, bool(enabled and split_complete))
+            if enabled and split_complete:
+                mapping.set_ignore(key, False)
+
+def reconcile_cross_identity_mappings(
+    mapping_a: ColumnMapping,
+    mapping_b: ColumnMapping,
+) -> list[str]:
+    """Synchronize Cross Match *semantic* identity policy across File A/B.
+
+    Physical headers may differ (Birthdate versus Month/Day/Year), but both
+    sides must use the same identity concepts.  If a concept is selected on
+    either side and both sides can represent it, enable it on both.  If only
+    one side can represent a selected concept, remove it from the exact key on
+    both sides and leave the available value as fuzzy/audit evidence.
+
+    This prevents a 100% Name + 100% DOB pair from falling through exact
+    classification merely because one mapping checkbox was accidentally off.
+    """
+    notes: list[str] = []
+
+    name_requested = any(
+        mapping_a.dedup_enabled(k) or mapping_b.dedup_enabled(k)
+        for k in ("full_name", "first", "middle", "last", "suffix")
+    )
+    a_structured = bool(mapping_a.first and mapping_a.last)
+    b_structured = bool(mapping_b.first and mapping_b.last)
+
+    if name_requested and a_structured and b_structured:
+        for side, mapping in (("A", mapping_a), ("B", mapping_b)):
+            before = (mapping.dedup_enabled("first"), mapping.dedup_enabled("last"))
+            mapping.set_dedup("first", True); mapping.set_ignore("first", False)
+            mapping.set_dedup("last", True); mapping.set_ignore("last", False)
+            if before != (True, True):
+                notes.append(f"File {side}: enabled First+Last to match the opposite side")
+            # Structured names are the canonical exact representation. Full Name
+            # remains mapped for display/fuzzy fallback, not as a competing key.
+            if mapping.full_name and mapping.dedup_enabled("full_name"):
+                mapping.set_dedup("full_name", False); mapping.set_ignore("full_name", True)
+                notes.append(f"File {side}: disabled duplicate Full Name key because structured First+Last are available")
+
+        middle_requested = mapping_a.dedup_enabled("middle") or mapping_b.dedup_enabled("middle")
+        if middle_requested:
+            if mapping_a.middle and mapping_b.middle:
+                for mapping in (mapping_a, mapping_b):
+                    mapping.set_dedup("middle", True); mapping.set_ignore("middle", False)
+            else:
+                if mapping_a.middle: mapping_a.set_dedup("middle", False)
+                if mapping_b.middle: mapping_b.set_dedup("middle", False)
+                notes.append("Middle Name selected on only one usable side; removed from exact key and retained as fuzzy evidence")
+
+        suffix_requested = mapping_a.dedup_enabled("suffix") or mapping_b.dedup_enabled("suffix")
+        if suffix_requested:
+            if mapping_a.suffix and mapping_b.suffix:
+                for mapping in (mapping_a, mapping_b):
+                    mapping.set_dedup("suffix", True); mapping.set_ignore("suffix", False)
+            else:
+                if mapping_a.suffix: mapping_a.set_dedup("suffix", False)
+                if mapping_b.suffix: mapping_b.set_dedup("suffix", False)
+                notes.append("Suffix selected on only one usable side; removed from exact key and retained as fuzzy evidence")
+
+    birth_requested = _birth_dedup_requested(mapping_a) or _birth_dedup_requested(mapping_b)
+    if birth_requested:
+        a_birth = _birth_path_available(mapping_a)
+        b_birth = _birth_path_available(mapping_b)
+        if a_birth and b_birth:
+            a_before = _birth_dedup_requested(mapping_a)
+            b_before = _birth_dedup_requested(mapping_b)
+            _set_complete_birth_dedup(mapping_a, True)
+            _set_complete_birth_dedup(mapping_b, True)
+            if not a_before or not b_before:
+                notes.append("Synchronized DOB deduplication across File A and File B using each side's available complete DOB representation")
+        else:
+            _set_complete_birth_dedup(mapping_a, False)
+            _set_complete_birth_dedup(mapping_b, False)
+            notes.append("DOB was selected asymmetrically but one side has no complete DOB representation; DOB removed from exact key and retained only as available evidence")
+
+    mapping_a.normalize_flags()
+    mapping_b.normalize_flags()
+    return notes
+
+
+def _header_quality(values: Sequence[Any]) -> tuple[int, int]:
+    detected = 0
+    nonempty = 0
+    for value in values:
+        text = str(value if value is not None else "").strip()
+        if not text:
+            continue
+        nonempty += 1
+        if guess_semantic(text) != "ignore":
+            detected += 1
+    return detected * 10 + min(nonempty, 20), detected
+
+
+def _detect_csv(path: Path) -> InputPlan:
+    raw = path.read_bytes()[:131072]
+    encoding = "utf-8-sig"
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin1"):
+        try:
+            text = raw.decode(enc)
+            encoding = enc
+            break
+        except UnicodeDecodeError:
+            continue
+    lines = text.splitlines()
+    directive_sep = None
+    skip_directive = 0
+    if lines and re.fullmatch(r"sep=(.)", lines[0].strip(), flags=re.IGNORECASE):
+        directive_sep = lines[0].strip()[-1]
+        skip_directive = 1
+    candidates = [directive_sep] if directive_sep else []
+    try:
+        sniff = csv.Sniffer().sniff(text, delimiters=",;\t|")
+        candidates.append(sniff.delimiter)
+    except Exception:
+        pass
+    candidates.extend([",", ";", "\t", "|"])
+    candidates = [x for i, x in enumerate(candidates) if x and x not in candidates[:i]]
+    best: tuple[int, str, int, list[str]] | None = None
+    for sep in candidates:
+        rows = []
+        try:
+            reader = csv.reader(lines[skip_directive:], delimiter=sep)
+            for row in reader:
+                rows.append(row)
+                if len(rows) >= 100:
+                    break
+        except Exception:
+            continue
+        for row_no, row in enumerate(rows):
+            score, detected = _header_quality(row)
+            if len(row) <= 1:
+                score -= 30
+            candidate = (score, sep, skip_directive + row_no, dedupe_headers(row))
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+    if best is None:
+        raise RuntimeError(f"Could not detect CSV structure: {path}")
+    _, sep, header_row, headers = best
+    return InputPlan(path, None, header_row, headers, sep, encoding)
+
+
+def _detect_excel(path: Path, requested_sheet: str | None = None) -> InputPlan:
+    from openpyxl import load_workbook
+    wb = load_workbook(path, read_only=True, data_only=True, keep_links=False)
+    try:
+        sheet_names = [ws.title for ws in wb.worksheets]
+        if not sheet_names:
+            raise RuntimeError("Workbook has no worksheets.")
+        if requested_sheet and requested_sheet not in {"Auto", "auto", ""}:
+            if requested_sheet not in sheet_names:
+                raise ValueError(f"Worksheet {requested_sheet!r} not found. Available: {', '.join(sheet_names)}")
+            candidates = [requested_sheet]
+        else:
+            candidates = sheet_names[:200]
+        best: tuple[int, str, int, list[str]] | None = None
+        for sheet_name in candidates:
+            ws = wb[sheet_name]
+            for row_no, row in enumerate(ws.iter_rows(min_row=1, max_row=100, values_only=True)):
+                values = list(row)
+                score, detected = _header_quality(values)
+                score -= row_no // 3
+                # Hidden helper/calculation sheets remain selectable explicitly,
+                # but Auto mode strongly prefers a usable visible worksheet.
+                if not requested_sheet or requested_sheet in {"Auto", "auto", ""}:
+                    if getattr(ws, "sheet_state", "visible") != "visible":
+                        score -= 50
+                candidate = (score, sheet_name, row_no, dedupe_headers(values))
+                if best is None or candidate[0] > best[0]:
+                    best = candidate
+        if best is None or best[0] < 20:
+            sheet_name = candidates[0]
+            ws = wb[sheet_name]
+            first = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), tuple())
+            return InputPlan(path, sheet_name, 0, dedupe_headers(first))
+        _, sheet_name, header_row, headers = best
+        return InputPlan(path, sheet_name, header_row, headers)
+    finally:
+        wb.close()
+
+
+def inspect_input(path: str | os.PathLike[str], sheet: str | None = None) -> InputPlan:
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(p)
+    if p.suffix.casefold() == ".csv":
+        return _detect_csv(p)
+    if p.suffix.casefold() in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+        return _detect_excel(p, sheet)
+    raise ValueError("Supported inputs are CSV and modern Excel files (.xlsx/.xlsm). Save old .xls as .xlsx or CSV.")
+
+
+def _excel_cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    return str(value)
+
+
+def _placeholder_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip().casefold()
+
+
+def _row_is_zero_placeholder(values: Sequence[Any]) -> bool:
+    """True only when the complete imported row is blank/zero/template filler.
+
+    A row with any meaningful non-zero value is kept. This means legitimate
+    records containing a zero amount/count are not discarded merely because
+    one field is zero.
+    """
+    found_any = False
+    for value in values:
+        token = _placeholder_text(value)
+        if token == "":
+            continue
+        found_any = True
+        if token not in ROW_PLACEHOLDER_TOKENS:
+            return False
+    return found_any
+
+
+def _drop_zero_placeholder_rows(chunk: pd.DataFrame) -> pd.DataFrame:
+    """Remove rows whose every populated cell is only blank/zero filler."""
+    if chunk is None or chunk.empty:
+        return chunk
+    placeholder = np.ones(len(chunk), dtype=bool)
+    has_value = np.zeros(len(chunk), dtype=bool)
+    for col in chunk.columns:
+        s = chunk[col].astype("string").fillna("").str.strip().str.casefold()
+        nonblank = s.ne("").to_numpy()
+        has_value |= nonblank
+        placeholder &= s.isin(ROW_PLACEHOLDER_TOKENS).to_numpy()
+        if not placeholder.any():
+            break
+    drop_mask = placeholder & has_value
+    if not drop_mask.any():
+        return chunk.reset_index(drop=True)
+    return chunk.loc[~drop_mask].reset_index(drop=True)
+
+
+def iter_input_chunks(plan: InputPlan, chunk_rows: int) -> Iterator[pd.DataFrame]:
+    if plan.path.suffix.casefold() == ".csv":
+        reader = pd.read_csv(
+            plan.path,
+            sep=plan.csv_sep,
+            encoding=plan.csv_encoding,
+            skiprows=plan.header_row,
+            header=0,
+            names=plan.headers,
+            dtype=str,
+            keep_default_na=False,
+            na_filter=False,
+            low_memory=False,
+            chunksize=chunk_rows,
+            engine="c",
+        )
+        for chunk in reader:
+            chunk.columns = plan.headers
+            chunk = chunk.fillna("").astype(str)
+            chunk = _drop_zero_placeholder_rows(chunk)
+            if not chunk.empty:
+                yield chunk
+        return
+
+    from openpyxl import load_workbook
+    wb = load_workbook(plan.path, read_only=True, data_only=True, keep_links=False)
+    try:
+        ws = wb[plan.sheet or wb.sheetnames[0]]
+        rows: list[list[str]] = []
+        start = plan.header_row + 2  # openpyxl is 1-based; skip header row
+        width = len(plan.headers)
+        for row in ws.iter_rows(min_row=start, values_only=True):
+            values = [_excel_cell_text(x) for x in list(row)[:width]]
+            if len(values) < width:
+                values.extend([""] * (width - len(values)))
+            if not any(str(x).strip() for x in values):
+                continue
+            if _row_is_zero_placeholder(values):
+                continue
+            rows.append(values)
+            if len(rows) >= chunk_rows:
+                yield pd.DataFrame(rows, columns=plan.headers, dtype=str)
+                rows = []
+        if rows:
+            yield pd.DataFrame(rows, columns=plan.headers, dtype=str)
+    finally:
+        wb.close()
+
+
+def _series(df: pd.DataFrame, column: str) -> pd.Series:
+    if column and column in df.columns:
+        return df[column].astype("string").fillna("").str.strip()
+    return pd.Series("", index=df.index, dtype="string")
+
+
+def missing_mask(series: pd.Series) -> pd.Series:
+    return series.astype("string").fillna("").str.strip().str.casefold().isin(MISSING_TOKENS)
+
+
+def normalize_name_series(series: pd.Series) -> pd.Series:
+    # Repair only clear mojibake signatures before Unicode normalization.
+    # This turns UTF-8/cp1252 artifacts such as TIÃ‘OSO into TIÑOSO, after
+    # which NFKD/ASCII normalization yields the same key as the clean spelling.
+    text = repair_common_mojibake_series(series).str.strip()
+    miss = text.str.casefold().isin(MISSING_TOKENS)
+    try:
+        text = text.str.normalize("NFKD").str.encode("ascii", errors="ignore").str.decode("ascii")
+    except Exception:
+        text = text.map(strip_accents)
+    text = text.str.casefold().str.replace(r"[^0-9a-z]+", " ", regex=True)
+    text = text.str.replace(r"\s+", " ", regex=True).str.strip().mask(miss, "")
+    return text.fillna("").astype(str)
+
+
+def normalize_exact_series(series: pd.Series) -> pd.Series:
+    text = normalize_name_series(series)
+    return text.str.replace(r"[^0-9a-z]+", "", regex=True).fillna("").astype(str)
+
+
+def normalize_month_series(series: pd.Series) -> pd.Series:
+    text = series.astype("string").fillna("").str.strip().str.casefold().str.replace(r"\.0$", "", regex=True)
+    out = pd.Series("", index=series.index, dtype="object")
+    numeric = pd.to_numeric(text, errors="coerce")
+    valid_num = numeric.between(1, 12)
+    out.loc[valid_num] = numeric.loc[valid_num].astype("Int64").astype(str).str.zfill(2)
+    remaining = out.eq("") & text.ne("")
+    if remaining.any():
+        keys = text.loc[remaining].map(lambda x: re.sub(r"[^a-z]", "", strip_accents(x)))
+        mapped = keys.map(MONTH_MAP)
+        valid = mapped.notna()
+        out.loc[mapped.index[valid]] = mapped.loc[valid].astype(int).astype(str).str.zfill(2)
+    return out.astype(str)
+
+
+def normalize_day_series(series: pd.Series) -> pd.Series:
+    text = series.astype("string").fillna("").str.strip().str.replace(r"\.0$", "", regex=True)
+    numeric = pd.to_numeric(text, errors="coerce")
+    out = pd.Series("", index=series.index, dtype="object")
+    valid = numeric.between(1, 31)
+    out.loc[valid] = numeric.loc[valid].astype("Int64").astype(str).str.zfill(2)
+    return out.astype(str)
+
+
+def normalize_year_series(series: pd.Series) -> pd.Series:
+    text = series.astype("string").fillna("").str.strip().str.replace(r"\.0$", "", regex=True)
+    four = text.str.extract(r"(\d{4})", expand=False)
+    years = pd.to_numeric(four, errors="coerce")
+    out = pd.Series("", index=series.index, dtype="object")
+    valid = years.between(1800, 2300)
+    out.loc[valid] = years.loc[valid].astype("Int64").astype(str).str.zfill(4)
+    two = out.eq("") & text.str.fullmatch(r"\d{2}", na=False)
+    if two.any():
+        yy = pd.to_numeric(text.loc[two], errors="coerce")
+        yyyy = np.where(yy >= 30, yy + 1900, yy + 2000)
+        out.loc[two] = pd.Series(yyyy, index=yy.index).astype("Int64").astype(str)
+    return out.astype(str)
+
+
+def ambiguous_date_mask(series: pd.Series) -> pd.Series:
+    text = series.astype("string").fillna("").str.strip()
+    parts = text.str.extract(r"^(\d{1,2})[./\-](\d{1,2})[./\-](\d{2,4})$")
+    a = pd.to_numeric(parts[0], errors="coerce")
+    b = pd.to_numeric(parts[1], errors="coerce")
+    return (a.between(1, 12) & b.between(1, 12) & a.ne(b)).fillna(False)
+
+
+def _birthdate_order_hint(header: Any) -> str:
+    """Infer explicit date order from a source header label when available."""
+    key = simple_header_key(header)
+    if not key:
+        return ""
+    if "mmddyyyy" in key or "mmddyy" in key:
+        return "mdy"
+    if "ddmmyyyy" in key or "ddmmyy" in key:
+        return "dmy"
+    if "yyyymmdd" in key or "yymmdd" in key:
+        return "ymd"
+    return ""
+
+
+def _infer_birthdate_order(series: pd.Series, header: Any = "") -> str:
+    """Infer MDY/DMY only from unambiguous values in the same column.
+
+    If both conventions appear, return no hint rather than guessing. This makes
+    Cross Match orientation-stable for ordinary MM/DD/YYYY or DD/MM/YYYY text
+    columns while still flagging genuinely mixed/ambiguous data for review.
+    """
+    explicit = _birthdate_order_hint(header or getattr(series, "name", ""))
+    if explicit:
+        return explicit
+    text = series.astype("string").fillna("").str.strip()
+    parts = text.str.extract(r"^(\d{1,2})[./\-](\d{1,2})[./\-](\d{2,4})$")
+    first = pd.to_numeric(parts[0], errors="coerce")
+    second = pd.to_numeric(parts[1], errors="coerce")
+    # first>12 can only be a day -> DMY. second>12 can only be a day -> MDY.
+    dmy = int((first.between(13, 31) & second.between(1, 12)).sum())
+    mdy = int((second.between(13, 31) & first.between(1, 12)).sum())
+    numeric_rows = int((first.notna() & second.notna()).sum())
+    support_needed = 1 if numeric_rows <= 50 else max(3, int(math.ceil(numeric_rows * 0.01)))
+    if mdy >= support_needed and dmy == 0:
+        return "mdy"
+    if dmy >= support_needed and mdy == 0:
+        return "dmy"
+    return ""
+
+
+def normalize_birthdate_series(
+    series: pd.Series,
+    min_age: int = 18,
+    max_age: int = 125,
+    date_order_hint: str = "",
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
+    """Return MM-DD-YYYY plus invalid/ambiguous/future/under-age/too-old masks.
+
+    Age limits:
+    - min_age <= 0 disables the under-age check.
+    - max_age <= 0 disables the too-old check.
+    """
+    raw = series.astype("string").fillna("").str.strip()
+    miss = raw.str.casefold().isin(MISSING_TOKENS)
+    out = pd.Series("", index=series.index, dtype="object")
+
+    numeric = pd.to_numeric(raw.str.replace(r"\.0$", "", regex=True), errors="coerce")
+    serial = numeric.between(1, 80000) & raw.str.fullmatch(r"\d+(?:\.0)?", na=False) & ~miss
+    if serial.any():
+        parsed_serial = pd.to_datetime(numeric.loc[serial], unit="D", origin="1899-12-30", errors="coerce")
+        out.loc[serial] = parsed_serial.dt.strftime("%m-%d-%Y").fillna("")
+
+    hint = str(date_order_hint or _birthdate_order_hint(getattr(series, "name", ""))).casefold()
+
+    remain = out.eq("") & ~miss
+    if remain.any():
+        if hint == "dmy":
+            try:
+                parsed = pd.to_datetime(raw.loc[remain], errors="coerce", format="mixed", dayfirst=True)
+            except Exception:
+                parsed = pd.to_datetime(raw.loc[remain], errors="coerce", dayfirst=True)
+        elif hint == "ymd":
+            try:
+                parsed = pd.to_datetime(raw.loc[remain], errors="coerce", format="mixed", yearfirst=True)
+            except Exception:
+                parsed = pd.to_datetime(raw.loc[remain], errors="coerce", yearfirst=True)
+        else:
+            try:
+                parsed = pd.to_datetime(raw.loc[remain], errors="coerce", format="mixed", dayfirst=False)
+            except Exception:
+                parsed = pd.to_datetime(raw.loc[remain], errors="coerce", dayfirst=False)
+        out.loc[remain] = parsed.dt.strftime("%m-%d-%Y").fillna("")
+
+    remain = out.eq("") & ~miss
+    if remain.any() and not hint:
+        try:
+            parsed2 = pd.to_datetime(raw.loc[remain], errors="coerce", format="mixed", dayfirst=True)
+        except Exception:
+            parsed2 = pd.to_datetime(raw.loc[remain], errors="coerce", dayfirst=True)
+        out.loc[remain] = parsed2.dt.strftime("%m-%d-%Y").fillna("")
+
+    invalid = ~miss & out.eq("")
+    ambiguous = (ambiguous_date_mask(raw) & ~miss) if not hint else pd.Series(False, index=series.index)
+    parsed_final = pd.to_datetime(out, format="%m-%d-%Y", errors="coerce")
+    today = pd.Timestamp(datetime.now().date())
+    future = parsed_final.gt(today).fillna(False)
+    age = today.year - parsed_final.dt.year - (((today.month * 100 + today.day) < (parsed_final.dt.month * 100 + parsed_final.dt.day)).astype("Int64"))
+    under_age = age.lt(int(min_age)).fillna(False) if int(min_age) > 0 else pd.Series(False, index=series.index)
+    too_old = age.gt(int(max_age)).fillna(False) if int(max_age) > 0 else pd.Series(False, index=series.index)
+    return out.astype(str), invalid, ambiguous, future, under_age, too_old
+
+
+def _join_parts(parts: Sequence[pd.Series], sep: str = " ") -> pd.Series:
+    if not parts:
+        return pd.Series(dtype=str)
+    out = parts[0].astype("string").fillna("")
+    for part in parts[1:]:
+        out = out.str.cat(part.astype("string").fillna(""), sep=sep)
+    if sep == " ":
+        out = out.str.replace(r"\s+", " ", regex=True).str.strip()
+    return out.fillna("").astype(str)
+
+
+def sorted_name_key(name: pd.Series, components: Sequence[pd.Series] | None = None) -> pd.Series:
+    if components:
+        arr = np.column_stack([s.astype(str).to_numpy() for s in components])
+        arr.sort(axis=1)
+        joined = [" ".join(x for x in row if x).strip() for row in arr]
+        return pd.Series(joined, index=name.index, dtype=str)
+    return name.map(lambda x: " ".join(sorted(t for t in str(x).split() if t))).astype(str)
+
+
+def _phonetic_series(name: pd.Series) -> pd.Series:
+    text = name.astype("string").fillna("").str.casefold()
+    text = text.str.replace("q", "k", regex=False).str.replace("k", "c", regex=False)
+    text = text.str.replace("ph", "f", regex=False).str.replace("z", "s", regex=False).str.replace("v", "b", regex=False)
+    return text.str.replace(r"\s+", " ", regex=True).str.strip().astype(str)
+
+
+_FUZZY_MINHASH_SEEDS = (0x9E3779B1, 0x85EBCA6B, 0xC2B2AE35, 0x27D4EB2F, 0x165667B1, 0xD3A2646C)
+
+
+def _token_bigram_minhashes(value: Any) -> tuple[int, ...]:
+    """Six deterministic bigram minhashes for typo-tolerant name blocking.
+
+    This is candidate discovery only. The final RapidFuzz scorer still decides
+    whether the pair is a fuzzy duplicate.
+    """
+    s = str(value or "")
+    if not s:
+        return (0,) * len(_FUZZY_MINHASH_SEEDS)
+    if len(s) < 2:
+        grams = [ord(s[0])]
+    else:
+        grams = [((ord(s[i]) & 0xFFFF) << 16) | (ord(s[i + 1]) & 0xFFFF) for i in range(len(s) - 1)]
+    out: list[int] = []
+    for seed in _FUZZY_MINHASH_SEEDS:
+        best = 0xFFFFFFFFFFFFFFFF
+        for gram in grams:
+            v = ((gram ^ seed) * 0x9E3779B185EBCA87) & 0xFFFFFFFFFFFFFFFF
+            v ^= (v >> 29)
+            if v < best:
+                best = v
+        out.append(int(best))
+    return tuple(out)
+
+
+def _combine_swap_invariant_minhash(first_values: pd.Series, last_values: pd.Series) -> list[np.ndarray]:
+    """Return six swap-invariant composite minhash arrays for First+Last."""
+    first_tuples = first_values.map(_token_bigram_minhashes).tolist()
+    last_tuples = last_values.map(_token_bigram_minhashes).tolist()
+    if not first_tuples:
+        return [np.zeros(0, dtype=np.uint64) for _ in _FUZZY_MINHASH_SEEDS]
+    fm = np.asarray(first_tuples, dtype=np.uint64)
+    lm = np.asarray(last_tuples, dtype=np.uint64)
+    missing = first_values.fillna("").astype(str).eq("").to_numpy() | last_values.fillna("").astype(str).eq("").to_numpy()
+    arrays: list[np.ndarray] = []
+    for i, seed in enumerate(_FUZZY_MINHASH_SEEDS):
+        lo = np.minimum(fm[:, i], lm[:, i])
+        hi = np.maximum(fm[:, i], lm[:, i])
+        combined = (lo * np.uint64(0x9E3779B185EBCA87)) ^ (hi * np.uint64(0xC2B2AE3D27D4EB4F)) ^ np.uint64(seed)
+        # Own the output buffer before masking. Some frozen/newer NumPy builds
+        # can expose non-writeable views from conversion paths.
+        combined = np.array(combined, dtype=np.uint64, copy=True, order="C")
+        combined[missing] = 0
+        arrays.append(combined)
+    return arrays
+
+
+def _writable_u64(values: Any) -> np.ndarray:
+    """Return a guaranteed writable C-contiguous uint64 array.
+
+    Newer Pandas/NumPy combinations may expose hash buffers through a read-only
+    NumPy view. CrossMatch masks blank hashes in-place, so we must own the
+    destination memory before assignment.
+    """
+    arr = np.array(values, dtype=np.uint64, copy=True, order="C")
+    if not arr.flags.writeable:
+        arr = arr.copy(order="C")
+    return arr
+
+
+def _stable_block_hash(series: pd.Series) -> np.ndarray:
+    hashed = pd.util.hash_pandas_object(series.astype(str), index=False, hash_key=HASH_KEY_1)
+    return _writable_u64(hashed.to_numpy(dtype=np.uint64, copy=True))
+
+
+def dual_hash(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    text = series.astype(str)
+    h1s = pd.util.hash_pandas_object(text, index=False, hash_key=HASH_KEY_1)
+    h2s = pd.util.hash_pandas_object(text, index=False, hash_key=HASH_KEY_2)
+    h1 = _writable_u64(h1s.to_numpy(dtype=np.uint64, copy=True))
+    h2 = _writable_u64(h2s.to_numpy(dtype=np.uint64, copy=True))
+    blank = text.eq("").to_numpy(dtype=bool, copy=True)
+    h1[blank] = 0
+    h2[blank] = 0
+    return h1, h2
+
+
+def adaptive_chunk_rows(requested: int, memory_percent: int, column_count: int) -> int:
+    if requested > 0:
+        return max(MIN_CHUNK_ROWS, min(MAX_CHUNK_ROWS, requested))
+    if psutil is None:
+        return DEFAULT_CHUNK_ROWS
+    available = int(psutil.virtual_memory().available * max(25, min(95, memory_percent)) / 100)
+    # Text DataFrames commonly need 250-600 bytes per cell during normalization.
+    estimated_per_row = max(2048, column_count * 420)
+    safe = available // max(estimated_per_row * 4, 1)
+    return max(MIN_CHUNK_ROWS, min(MAX_CHUNK_ROWS, int(safe)))
+
+
+def _finding_reason(code: int, min_age: int = 18, max_age: int = 125) -> str:
+    reasons: list[str] = []
+    if code & F_MISSING_NAME: reasons.append("Missing Full Name")
+    if code & F_MISSING_FIRST: reasons.append("Missing First Name")
+    if code & F_MISSING_MIDDLE: reasons.append("Missing Middle Name")
+    if code & F_MISSING_LAST: reasons.append("Missing Last Name")
+    if code & F_MISSING_SUFFIX: reasons.append("Missing Extension / Suffix")
+    if code & F_MISSING_BIRTH: reasons.append("Missing Birthdate")
+    if code & F_MISSING_BIRTH_MONTH: reasons.append("Missing Birth Month")
+    if code & F_MISSING_BIRTH_DAY: reasons.append("Missing Birth Day")
+    if code & F_MISSING_BIRTH_YEAR: reasons.append("Missing Birth Year")
+    if code & F_INVALID_BIRTH: reasons.append("Invalid Birthdate")
+    if code & F_AMBIGUOUS_BIRTH: reasons.append("Ambiguous Birthdate")
+    if code & F_FUTURE_BIRTH: reasons.append("Not Yet Born")
+    if code & F_UNDER_AGE:
+        reasons.append(f"Under Age (<{int(min_age)})" if int(min_age) > 0 else "Under Age")
+    if code & F_TOO_OLD:
+        reasons.append(f"Too Old (>{int(max_age)})" if int(max_age) > 0 else "Too Old")
+    if code & F_MISSING_EXACT: reasons.append("Missing selected Review field")
+    if code & F_AMBIGUOUS_MATCH: reasons.append("Ambiguous fuzzy identity evidence")
+    return "; ".join(reasons) or "Record requires review"
+
+
+
+def _review_value_state(value: Any) -> tuple[bool, str]:
+    """Return (is_missing, human explanation) for one source cell."""
+    try:
+        if pd.isna(value):
+            return True, "blank cell"
+    except Exception:
+        pass
+    raw = str(value or "").strip()
+    folded = raw.casefold()
+    if folded == "":
+        return True, "blank cell"
+    if folded in MISSING_TOKENS:
+        if folded in {"0", "0.0", "0.00", "0.000"}:
+            return True, f'value "{raw}" is treated as a missing/placeholder value'
+        return True, f'value "{raw}" is treated as missing'
+    return False, f'value "{raw}"'
+
+
+def _row_cell(row: Any, header: str) -> Any:
+    header = str(header or "").strip()
+    if not header:
+        return ""
+    try:
+        if isinstance(row, pd.Series):
+            return row.get(header, "")
+        if isinstance(row, dict):
+            return row.get(header, "")
+        return row[header] if header in row else ""
+    except Exception:
+        return ""
+
+
+def _mapped_header_label(mapping: ColumnMapping, key: str, fallback: str) -> str:
+    header = str(getattr(mapping, key, "") or "").strip()
+    return header or fallback
+
+
+def _birth_source_detail(row: Any, mapping: ColumnMapping) -> str:
+    parts: list[str] = []
+    if mapping.birthdate:
+        value = _row_cell(row, mapping.birthdate)
+        parts.append(f'{mapping.birthdate}="{str(value or "").strip() or "<blank>"}"')
+    else:
+        for key, fallback in (
+            ("birth_month", "Birth Month"),
+            ("birth_day", "Birth Day"),
+            ("birth_year", "Birth Year"),
+        ):
+            header = str(getattr(mapping, key, "") or "").strip()
+            if header:
+                value = _row_cell(row, header)
+                parts.append(f'{header}="{str(value or "").strip() or "<blank>"}"')
+    return ", ".join(parts) or "selected birth field(s)"
+
+
+def _detailed_finding_reason(
+    row: Any,
+    mapping: ColumnMapping,
+    code: int,
+    min_age: int = 18,
+    max_age: int = 125,
+) -> str:
+    """Short, plain-language reason for RECORDS FOR REVIEW.
+
+    Keep Review/ConflictReason easy to read, similar to Cross Match reasons.
+    Do not expose raw spreadsheet values or technical parser details here.
+    Matching/classification logic is unchanged; this function changes wording only.
+    """
+    parts: list[str] = []
+
+    def add_once(note: str) -> None:
+        note = str(note or "").strip()
+        if note and note not in parts:
+            parts.append(note)
+
+    # Friendly semantic labels instead of raw source header names such as
+    # birthday_month / first_name. The original source columns remain in the
+    # exported workbook, so the user can inspect the actual record beside this
+    # concise reason.
+    missing_rules = (
+        (F_MISSING_NAME, "Missing full name"),
+        (F_MISSING_FIRST, "Missing first name"),
+        (F_MISSING_MIDDLE, "Missing middle name"),
+        (F_MISSING_LAST, "Missing last name"),
+        (F_MISSING_SUFFIX, "Missing suffix"),
+        (F_MISSING_BIRTH, "Missing birthdate"),
+        (F_MISSING_BIRTH_MONTH, "Missing birth month"),
+        (F_MISSING_BIRTH_DAY, "Missing birth day"),
+        (F_MISSING_BIRTH_YEAR, "Missing birth year"),
+    )
+    for bit, note in missing_rules:
+        if code & bit:
+            add_once(note)
+
+    if code & F_MISSING_EXACT:
+        selected_headers = list(dict.fromkeys(
+            [str(h).strip() for h in (
+                mapping.active_exact_review_fields() + list(mapping.review_headers or [])
+            ) if str(h).strip()]
+        ))
+        missing_headers: list[str] = []
+        for header in selected_headers:
+            value = _row_cell(row, header)
+            is_missing, _state = _review_value_state(value)
+            if is_missing:
+                missing_headers.append(header)
+        if len(missing_headers) == 1:
+            add_once(f"Missing {missing_headers[0]}")
+        elif missing_headers:
+            add_once("Missing selected review fields")
+        else:
+            add_once("Check selected review field")
+
+    if code & F_INVALID_BIRTH:
+        add_once("Invalid birthdate")
+    if code & F_AMBIGUOUS_BIRTH:
+        add_once("Birthdate needs checking")
+    if code & F_FUTURE_BIRTH:
+        add_once("Birthdate is in the future")
+    if code & F_UNDER_AGE:
+        add_once(f"Age below {int(min_age)}" if int(min_age) > 0 else "Under-age record")
+    if code & F_TOO_OLD:
+        add_once(f"Age above {int(max_age)}" if int(max_age) > 0 else "Age above allowed limit")
+    if code & F_AMBIGUOUS_MATCH:
+        add_once("Similar name")
+        add_once("Not enough supporting data")
+
+    if not parts:
+        return "Review | Manual checking needed"
+    return "Review | " + " | ".join(parts)
+
+def build_keys(chunk: pd.DataFrame, mapping: ColumnMapping, apply_finding: bool, min_age: int = 18, max_age: int = 125, build_fuzzy_blocks: bool = True) -> dict[str, Any]:
+    """Build matching keys and Review flags with row-wise alternative fallbacks.
+
+    Important behavior:
+    - Full Name can fall back to First/Last, and First/Last can fall back to Full Name.
+    - Birthdate can fall back to split Month/Day/Year, and vice versa.
+    - A row is not sent to Review merely because one duplicate representation is blank.
+    - Middle Name and Suffix are only required when their Review checkbox is explicitly enabled.
+    """
+    idx = chunk.index
+    empty = pd.Series("", index=idx, dtype=str)
+
+    first = normalize_name_series(_series(chunk, mapping.first)) if mapping.first else empty.copy()
+    middle = normalize_name_series(_series(chunk, mapping.middle)) if mapping.middle else empty.copy()
+    last = normalize_name_series(_series(chunk, mapping.last)) if mapping.last else empty.copy()
+    suffix = normalize_name_series(_series(chunk, mapping.suffix)) if mapping.suffix else empty.copy()
+    full_name = normalize_name_series(_series(chunk, mapping.full_name)) if mapping.full_name else empty.copy()
+
+    use_first = bool(mapping.first and mapping.dedup_enabled("first"))
+    use_middle = bool(mapping.middle and mapping.dedup_enabled("middle"))
+    use_last = bool(mapping.last and mapping.dedup_enabled("last"))
+    use_suffix = bool(mapping.suffix and mapping.dedup_enabled("suffix"))
+    use_full = bool(mapping.full_name and mapping.dedup_enabled("full_name"))
+
+    structured_parts: list[pd.Series] = []
+    structured_components: list[pd.Series] = []
+    structured_required = pd.Series(True, index=idx)
+    structured_has_required = False
+
+    # Preserve Last + First + optional Middle/Suffix key order.
+    if use_last:
+        structured_parts.append(last); structured_components.append(last)
+        structured_required &= last.ne(""); structured_has_required = True
+    if use_first:
+        structured_parts.append(first); structured_components.append(first)
+        structured_required &= first.ne(""); structured_has_required = True
+    if use_middle:
+        structured_parts.append(middle); structured_components.append(middle)
+    if use_suffix:
+        structured_parts.append(suffix); structured_components.append(suffix)
+
+    structured_name = _join_parts(structured_parts) if structured_parts else empty.copy()
+    structured_swap = sorted_name_key(structured_name, structured_components) if structured_parts else empty.copy()
+    if structured_parts and not structured_has_required:
+        structured_required = structured_name.ne("")
+    full_valid = full_name.ne("") if use_full else pd.Series(False, index=idx)
+    structured_valid = structured_required & structured_name.ne("") if structured_parts else pd.Series(False, index=idx)
+
+    if structured_parts and use_full:
+        # Prefer structured fields when complete, otherwise use Full Name row by row.
+        name = structured_name.where(structured_valid, full_name)
+        swap_name = structured_swap.where(structured_valid, sorted_name_key(full_name))
+        required_name = structured_valid | full_valid
+    elif structured_parts:
+        name = structured_name
+        swap_name = structured_swap
+        required_name = structured_valid
+    elif use_full:
+        name = full_name
+        swap_name = sorted_name_key(full_name)
+        required_name = full_valid
+    else:
+        name = empty.copy(); swap_name = empty.copy()
+        required_name = pd.Series(True, index=idx)
+
+    # Parse both birth representations independently so one can rescue the other.
+    birthdate_available = bool(mapping.birthdate)
+    split_birth_available = bool(mapping.birth_month and mapping.birth_day and mapping.birth_year)
+    use_birthdate = birthdate_available and mapping.dedup_enabled("birthdate")
+    use_split_birth = split_birth_available and all(
+        mapping.dedup_enabled(key) for key in ("birth_month", "birth_day", "birth_year")
+    )
+    review_birthdate = birthdate_available and mapping.review_enabled("birthdate")
+    review_split_any = split_birth_available and any(
+        mapping.review_enabled(key) for key in ("birth_month", "birth_day", "birth_year")
+    )
+
+    full_birth = empty.copy()
+    full_invalid = pd.Series(False, index=idx)
+    full_ambiguous = pd.Series(False, index=idx)
+    full_future = pd.Series(False, index=idx)
+    full_under_age = pd.Series(False, index=idx)
+    full_too_old = pd.Series(False, index=idx)
+    full_raw_missing = pd.Series(False, index=idx)
+    if birthdate_available:
+        full_raw = _series(chunk, mapping.birthdate)
+        full_raw_missing = missing_mask(full_raw)
+        full_birth, full_invalid, full_ambiguous, full_future, full_under_age, full_too_old = normalize_birthdate_series(
+            full_raw, min_age=min_age, max_age=max_age,
+            date_order_hint=_infer_birthdate_order(full_raw, mapping.birthdate),
+        )
+
+    month_norm = empty.copy(); day_norm = empty.copy(); year_norm = empty.copy()
+    split_birth = empty.copy()
+    split_invalid = pd.Series(False, index=idx)
+    split_future = pd.Series(False, index=idx)
+    split_under_age = pd.Series(False, index=idx)
+    split_too_old = pd.Series(False, index=idx)
+    month_raw_missing = pd.Series(False, index=idx)
+    day_raw_missing = pd.Series(False, index=idx)
+    year_raw_missing = pd.Series(False, index=idx)
+    month_component_invalid = pd.Series(False, index=idx)
+    day_component_invalid = pd.Series(False, index=idx)
+    year_component_invalid = pd.Series(False, index=idx)
+    if split_birth_available and (use_split_birth or review_split_any or min_age > 0 or max_age > 0):
+        month_raw = _series(chunk, mapping.birth_month)
+        day_raw = _series(chunk, mapping.birth_day)
+        year_raw = _series(chunk, mapping.birth_year)
+        month_raw_missing = missing_mask(month_raw)
+        day_raw_missing = missing_mask(day_raw)
+        year_raw_missing = missing_mask(year_raw)
+        month_norm = normalize_month_series(month_raw)
+        day_norm = normalize_day_series(day_raw)
+        year_norm = normalize_year_series(year_raw)
+        month_component_invalid = ~month_raw_missing & month_norm.eq("")
+        day_component_invalid = ~day_raw_missing & day_norm.eq("")
+        year_component_invalid = ~year_raw_missing & year_norm.eq("")
+        split_complete = month_norm.ne("") & day_norm.ne("") & year_norm.ne("")
+        split_birth = (month_norm + "-" + day_norm + "-" + year_norm).where(split_complete, "")
+        parsed_split = pd.to_datetime(split_birth, format="%m-%d-%Y", errors="coerce")
+        split_invalid = month_component_invalid | day_component_invalid | year_component_invalid | (split_complete & parsed_split.isna())
+        today = pd.Timestamp(datetime.now().date())
+        split_future = parsed_split.gt(today).fillna(False)
+        split_age = today.year - parsed_split.dt.year - (
+            ((today.month * 100 + today.day) < (parsed_split.dt.month * 100 + parsed_split.dt.day)).astype("Int64")
+        )
+        split_under_age = split_age.lt(int(min_age)).fillna(False) if int(min_age) > 0 else pd.Series(False, index=idx)
+        split_too_old = split_age.gt(int(max_age)).fillna(False) if int(max_age) > 0 else pd.Series(False, index=idx)
+
+    # Independent DOB evidence components used for audit scoring.
+    # They are collected even when DOB is not selected as a duplicate gate.
+    evidence_month = empty.copy()
+    evidence_day = empty.copy()
+    evidence_year = empty.copy()
+
+    if mapping.birth_month:
+        evidence_month = normalize_month_series(_series(chunk, mapping.birth_month))
+    if mapping.birth_day:
+        evidence_day = normalize_day_series(_series(chunk, mapping.birth_day))
+    if mapping.birth_year:
+        evidence_year = normalize_year_series(_series(chunk, mapping.birth_year))
+
+    if birthdate_available:
+        full_month = full_birth.astype(str).str.slice(0, 2).where(full_birth.ne(""), "")
+        full_day = full_birth.astype(str).str.slice(3, 5).where(full_birth.ne(""), "")
+        full_year = full_birth.astype(str).str.slice(-4).where(full_birth.ne(""), "")
+        evidence_month = evidence_month.where(evidence_month.ne(""), full_month)
+        evidence_day = evidence_day.where(evidence_day.ne(""), full_day)
+        evidence_year = evidence_year.where(evidence_year.ne(""), full_year)
+
+    # Age limits are Review/Finding rules, not birth-key validity rules.
+    # This keeps checkbox behavior honest: when Birthdate Review is OFF, age
+    # alone does not silently disable duplicate matching.
+    full_birth_valid = full_birth.ne("") & ~full_invalid & ~full_future
+    split_birth_valid = split_birth.ne("") & ~split_invalid & ~split_future
+
+    if use_birthdate and use_split_birth:
+        birth = full_birth.where(full_birth_valid, split_birth)
+        birth_valid = full_birth_valid | split_birth_valid
+    elif use_birthdate:
+        birth = full_birth
+        birth_valid = full_birth_valid
+    elif use_split_birth:
+        birth = split_birth
+        birth_valid = split_birth_valid
+    else:
+        birth = empty.copy()
+        birth_valid = pd.Series(True, index=idx)
+
+    has_name = mapping.has_name()
+    has_birth = mapping.has_birth()
+    has_exact = mapping.has_exact()
+    valid = pd.Series(True, index=idx)
+    parts_final: list[pd.Series] = []
+    parts_swap: list[pd.Series] = []
+
+    if has_name:
+        valid &= required_name
+        parts_final.append("NAME=" + name)
+        parts_swap.append("NAME=" + swap_name)
+    # A shared date of birth is not enough to identify a beneficiary. Do not
+    # create an exact duplicate key from DOB alone; it must accompany a name.
+    if has_birth and has_name:
+        valid &= birth_valid
+        parts_final.append("BIRTH=" + birth)
+        parts_swap.append("BIRTH=" + birth)
+
+    exact_parts: list[pd.Series] = []
+    exact_dedup_headers = mapping.active_exact_dedup_fields()
+    if has_exact:
+        exact_parts = [normalize_exact_series(_series(chunk, c)) for c in exact_dedup_headers]
+        # Exact fields are required only when they are the actual fallback identity key.
+        if not parts_final:
+            for p in exact_parts:
+                valid &= p.ne("")
+            parts_final = [f"{c}=" + p for c, p in zip(exact_dedup_headers, exact_parts)]
+            parts_swap = list(parts_final)
+
+    final_key = _join_parts(parts_final, "||").where(valid, "") if parts_final else empty.copy()
+    swap_key = _join_parts(parts_swap, "||").where(valid, "") if parts_swap else empty.copy()
+
+    finding = np.zeros(len(chunk), dtype=np.uint16)
+    if apply_finding:
+        # Name Review: Full Name and structured First/Last are alternative paths.
+        review_full = bool(mapping.full_name and mapping.review_enabled("full_name"))
+        review_first = bool(mapping.first and mapping.review_enabled("first"))
+        review_last = bool(mapping.last and mapping.review_enabled("last"))
+        review_middle = bool(mapping.middle and mapping.review_enabled("middle"))
+        review_suffix = bool(mapping.suffix and mapping.review_enabled("suffix"))
+        structured_review_selected = review_first or review_last
+
+        if review_full and structured_review_selected:
+            structured_review_ok = pd.Series(True, index=idx)
+            if review_first:
+                structured_review_ok &= first.ne("")
+            if review_last:
+                structured_review_ok &= last.ne("")
+            name_review_fail = ~(full_name.ne("") | structured_review_ok)
+            finding[(name_review_fail & full_name.eq("")).to_numpy()] |= F_MISSING_NAME
+            if review_first:
+                finding[(name_review_fail & first.eq("")).to_numpy()] |= F_MISSING_FIRST
+            if review_last:
+                finding[(name_review_fail & last.eq("")).to_numpy()] |= F_MISSING_LAST
+        else:
+            if review_full:
+                finding[full_name.eq("").to_numpy()] |= F_MISSING_NAME
+            if review_first:
+                finding[first.eq("").to_numpy()] |= F_MISSING_FIRST
+            if review_last:
+                finding[last.eq("").to_numpy()] |= F_MISSING_LAST
+
+        # Middle and suffix remain optional unless the user explicitly checked Review.
+        if review_middle:
+            finding[middle.eq("").to_numpy()] |= F_MISSING_MIDDLE
+        if review_suffix:
+            finding[suffix.eq("").to_numpy()] |= F_MISSING_SUFFIX
+
+        # A consistently parsed date column should not send nearly every row to Review
+        # merely because text dates are technically MM/DD vs DD/MM ambiguous.
+        ambiguous_for_review = full_ambiguous.copy()
+        nonmissing_full = _series(chunk, mapping.birthdate).astype("string").fillna("").str.strip().ne("") if birthdate_available else pd.Series(False, index=idx)
+        denominator = int(nonmissing_full.sum())
+        if denominator > 0 and int(full_ambiguous.sum()) / denominator >= 0.90 and bool(full_birth_valid.any()):
+            # Rebuild rather than mutate a potentially read-only Pandas-backed view.
+            ambiguous_for_review = pd.Series(False, index=idx, dtype=bool)
+
+        review_split_keys = [
+            key for key in ("birth_month", "birth_day", "birth_year")
+            if getattr(mapping, key) and mapping.review_enabled(key)
+        ]
+        both_birth_paths = review_birthdate and bool(review_split_keys)
+
+        # Split path can be reviewed by selected components; full date validity is
+        # required only when all three split components are selected.
+        split_review_ok = pd.Series(True, index=idx)
+        if "birth_month" in review_split_keys:
+            split_review_ok &= month_norm.ne("")
+        if "birth_day" in review_split_keys:
+            split_review_ok &= day_norm.ne("")
+        if "birth_year" in review_split_keys:
+            split_review_ok &= year_norm.ne("")
+        if set(review_split_keys) == {"birth_month", "birth_day", "birth_year"}:
+            split_review_ok &= split_birth_valid & ~split_under_age & ~split_too_old
+
+        full_review_ok = full_birth_valid & ~ambiguous_for_review & ~full_under_age & ~full_too_old
+        if both_birth_paths:
+            birth_review_fail = ~(full_review_ok | split_review_ok)
+            finding[(birth_review_fail & full_raw_missing).to_numpy()] |= F_MISSING_BIRTH
+            finding[(birth_review_fail & full_invalid).to_numpy()] |= F_INVALID_BIRTH
+            finding[(birth_review_fail & ambiguous_for_review).to_numpy()] |= F_AMBIGUOUS_BIRTH
+            finding[(birth_review_fail & full_future).to_numpy()] |= F_FUTURE_BIRTH
+            finding[(birth_review_fail & full_under_age).to_numpy()] |= F_UNDER_AGE
+            finding[(birth_review_fail & full_too_old).to_numpy()] |= F_TOO_OLD
+            if "birth_month" in review_split_keys:
+                finding[(birth_review_fail & month_raw_missing).to_numpy()] |= F_MISSING_BIRTH_MONTH
+            if "birth_day" in review_split_keys:
+                finding[(birth_review_fail & day_raw_missing).to_numpy()] |= F_MISSING_BIRTH_DAY
+            if "birth_year" in review_split_keys:
+                finding[(birth_review_fail & year_raw_missing).to_numpy()] |= F_MISSING_BIRTH_YEAR
+            finding[(birth_review_fail & split_invalid).to_numpy()] |= F_INVALID_BIRTH
+            finding[(birth_review_fail & split_future).to_numpy()] |= F_FUTURE_BIRTH
+            finding[(birth_review_fail & split_under_age).to_numpy()] |= F_UNDER_AGE
+            finding[(birth_review_fail & split_too_old).to_numpy()] |= F_TOO_OLD
+        else:
+            if review_birthdate:
+                finding[full_raw_missing.to_numpy()] |= F_MISSING_BIRTH
+                finding[full_invalid.to_numpy()] |= F_INVALID_BIRTH
+                finding[ambiguous_for_review.to_numpy()] |= F_AMBIGUOUS_BIRTH
+                finding[full_future.to_numpy()] |= F_FUTURE_BIRTH
+                finding[full_under_age.to_numpy()] |= F_UNDER_AGE
+                finding[full_too_old.to_numpy()] |= F_TOO_OLD
+            if review_split_keys:
+                if "birth_month" in review_split_keys:
+                    finding[month_raw_missing.to_numpy()] |= F_MISSING_BIRTH_MONTH
+                if "birth_day" in review_split_keys:
+                    finding[day_raw_missing.to_numpy()] |= F_MISSING_BIRTH_DAY
+                if "birth_year" in review_split_keys:
+                    finding[year_raw_missing.to_numpy()] |= F_MISSING_BIRTH_YEAR
+                if set(review_split_keys) == {"birth_month", "birth_day", "birth_year"}:
+                    finding[split_invalid.to_numpy()] |= F_INVALID_BIRTH
+                    finding[split_future.to_numpy()] |= F_FUTURE_BIRTH
+                    finding[split_under_age.to_numpy()] |= F_UNDER_AGE
+                    finding[split_too_old.to_numpy()] |= F_TOO_OLD
+
+        # Age limits are independent settings, not hidden DOB Review toggles.
+        # Preserve the alternative-DOB policy: a valid in-range representation
+        # can rescue another representation. Missing/invalid dates are handled
+        # by their existing review policy, not invented age findings.
+        if int(min_age) > 0 or int(max_age) > 0:
+            full_age_usable = full_birth_valid & bool(
+                birthdate_available and not mapping.ignore_enabled("birthdate"))
+            split_age_usable = split_birth_valid & bool(
+                split_birth_available and all(not mapping.ignore_enabled(k)
+                    for k in ("birth_month", "birth_day", "birth_year")))
+            age_ok = (full_age_usable & ~full_under_age & ~full_too_old) | (
+                split_age_usable & ~split_under_age & ~split_too_old)
+            finding[((~age_ok) & ((full_age_usable & full_under_age) |
+                (split_age_usable & split_under_age))).to_numpy()] |= F_UNDER_AGE
+            finding[((~age_ok) & ((full_age_usable & full_too_old) |
+                (split_age_usable & split_too_old))).to_numpy()] |= F_TOO_OLD
+
+        exact_review_headers = mapping.active_exact_review_fields()
+        generic_review_headers = [
+            h for h in (mapping.review_headers or [])
+            if h in chunk.columns and h not in set(exact_review_headers)
+        ]
+        if exact_review_headers or generic_review_headers:
+            missing_selected = pd.Series(False, index=idx)
+            for c in exact_review_headers:
+                missing_selected |= normalize_exact_series(_series(chunk, c)).eq("")
+            for c in generic_review_headers:
+                # Generic header Review is intentionally a missing-cell check.
+                # Type-specific invalid checks remain available through Meaning
+                # mappings such as Birthdate/Birth Month/Birth Day/Birth Year.
+                missing_selected |= missing_mask(_series(chunk, c))
+            finding[missing_selected.to_numpy()] |= F_MISSING_EXACT
+
+    birth_year = pd.to_numeric(evidence_year, errors="coerce").fillna(0).astype(np.int16).to_numpy()
+    if build_fuzzy_blocks:
+        phon = _phonetic_series(name)
+        compact = phon.str.replace(" ", "", regex=False)
+        tokens = phon.str.split()
+
+        # Full Name candidate discovery should treat common suffix spellings as
+        # metadata rather than as the surname edge token. Without this,
+        # "JUAN REYES JR" and "JUAN REYES JUNIOR" could land in different
+        # candidate blocks even though the core identity is the same.
+        def identity_name_tokens(values: Any) -> list[str]:
+            if not isinstance(values, list):
+                return []
+            out_tokens = [str(x or "") for x in values if str(x or "")]
+            suffix_words = {"jr", "junior", "sr", "senior", "ii", "iii", "iv", "v"}
+            while out_tokens and out_tokens[-1] in suffix_words:
+                out_tokens.pop()
+            return out_tokens
+
+        identity_tokens = tokens.map(identity_name_tokens)
+        fallback_first_token = identity_tokens.str[0].fillna("")
+        fallback_last_token = identity_tokens.str[-1].fillna("")
+        # Use structured edge tokens only where both are actually available.
+        structured_edges_available = use_first and use_last
+        if structured_edges_available:
+            structured_first_token = _phonetic_series(first)
+            structured_last_token = _phonetic_series(last)
+            edge_ok = first.ne("") & last.ne("")
+            first_token = structured_first_token.where(edge_ok, fallback_first_token)
+            last_token = structured_last_token.where(edge_ok, fallback_last_token)
+        else:
+            first_token = fallback_first_token
+            last_token = fallback_last_token
+        sorted_phon = identity_tokens.map(lambda values: "".join(sorted(values)) if isinstance(values, list) else "")
+        lead6 = compact.str.slice(0, 6).where(compact.str.len() >= 4, "")
+        tail6 = compact.str.slice(-6).where(compact.str.len() >= 4, "")
+        sorted10 = sorted_phon.str.slice(0, 10).where(sorted_phon.str.len() >= 6, "")
+        first4 = first_token.str.slice(0, 4)
+        last4 = last_token.str.slice(0, 4)
+        ordered_edge = (first4 + "|" + last4).where(first4.ne("") & last4.ne(""), "")
+        first_skeleton = first_token.str.replace(r"[aeiouy]", "", regex=True).str.slice(0, 10)
+        last_skeleton = last_token.str.replace(r"[aeiouy]", "", regex=True).str.slice(0, 10)
+        first_fallback = first_token.str.slice(0, 8)
+        last_fallback = last_token.str.slice(0, 8)
+        first_edge = first_skeleton.where(first_skeleton.str.len() >= 2, first_fallback)
+        last_edge = last_skeleton.where(last_skeleton.str.len() >= 2, last_fallback)
+        unordered_edge = pd.Series(
+            np.where(first_edge.le(last_edge), first_edge + "|" + last_edge, last_edge + "|" + first_edge),
+            index=idx, dtype="object",
+        ).where(first_edge.ne("") & last_edge.ne(""), "")
+        # Strong typo-tolerant name-shape signatures. These always combine both
+        # edge names (or all Full Name tokens), so they do not degrade into a
+        # surname-only bucket on common names. Birthdate is intentionally absent.
+        def token_head_shape_series(series: pd.Series) -> pd.Series:
+            s = series.fillna("").astype(str)
+            return (s.str.slice(0, 2) + s.str.slice(-1)).where(s.str.len() >= 3, s)
+
+        def token_tail_shape_series(series: pd.Series) -> pd.Series:
+            s = series.fillna("").astype(str)
+            return (s.str.slice(0, 1) + s.str.slice(-2)).where(s.str.len() >= 3, s)
+
+        first_head = token_head_shape_series(first_token)
+        last_head = token_head_shape_series(last_token)
+        first_tail = token_tail_shape_series(first_token)
+        last_tail = token_tail_shape_series(last_token)
+        ordered_head_shape = (first_head + "|" + last_head).where(first_head.ne("") & last_head.ne(""), "")
+        ordered_tail_shape = (first_tail + "|" + last_tail).where(first_tail.ne("") & last_tail.ne(""), "")
+        unordered_head_shape = pd.Series(
+            np.where(first_head.le(last_head), first_head + "|" + last_head, last_head + "|" + first_head),
+            index=idx, dtype="object",
+        ).where(first_head.ne("") & last_head.ne(""), "")
+        unordered_tail_shape = pd.Series(
+            np.where(first_tail.le(last_tail), first_tail + "|" + last_tail, last_tail + "|" + first_tail),
+            index=idx, dtype="object",
+        ).where(first_tail.ne("") & last_tail.ne(""), "")
+
+        # Middle-name rescue is deliberately selective: exact/phonetic middle
+        # plus the boundary characters of BOTH edge names. It recovers a pair
+        # when First and Last each have an interior typo without opening a broad
+        # Middle+Surname candidate bucket.
+        if use_middle:
+            middle_token = _phonetic_series(middle)
+            mid4 = middle_token.str.slice(0, 4)
+            edge_initials = pd.Series(
+                np.where(first_token.str.slice(0,1).le(last_token.str.slice(0,1)),
+                         first_token.str.slice(0,1) + last_token.str.slice(0,1),
+                         last_token.str.slice(0,1) + first_token.str.slice(0,1)),
+                index=idx, dtype="object",
+            )
+            edge_tails = pd.Series(
+                np.where(first_token.str.slice(-1).le(last_token.str.slice(-1)),
+                         first_token.str.slice(-1) + last_token.str.slice(-1),
+                         last_token.str.slice(-1) + first_token.str.slice(-1)),
+                index=idx, dtype="object",
+            )
+            middle_rescue = (mid4 + "|" + edge_initials + "|" + edge_tails).where(
+                mid4.ne("") & first_token.ne("") & last_token.ne(""), ""
+            )
+        else:
+            middle_rescue = pd.Series("", index=idx, dtype="object")
+
+        # Whole-name shape multisets support Full Name-only files and reordering.
+        # Interior spelling errors often leave these shapes stable.
+        def whole_shape(values: Any, tail: bool = False) -> str:
+            if not isinstance(values, list):
+                return ""
+            shaped: list[str] = []
+            for token in values:
+                token = str(token or "")
+                if len(token) < 2:
+                    continue
+                if len(token) >= 3:
+                    shape = (token[:1] + token[-2:]) if tail else (token[:2] + token[-1:])
+                else:
+                    shape = token
+                shaped.append(shape)
+            return "|".join(sorted(shaped)) if len(shaped) >= 2 else ""
+
+        whole_head_shape = identity_tokens.map(lambda values: whole_shape(values, False))
+        whole_tail_shape = identity_tokens.map(lambda values: whole_shape(values, True))
+
+        # Eight extra typo-rescue lanes: six bigram minhashes plus simple
+        # start/end qgram pairs. They are swap-invariant and always combine
+        # both First and Last names, so DOB can be completely different.
+        lsh_arrays = _combine_swap_invariant_minhash(first_token, last_token)
+        start_first = first_token.str.slice(0, 2).where(first_token.str.len() >= 2, "")
+        start_last = last_token.str.slice(0, 2).where(last_token.str.len() >= 2, "")
+        end_first = first_token.str.slice(-2).where(first_token.str.len() >= 2, "")
+        end_last = last_token.str.slice(-2).where(last_token.str.len() >= 2, "")
+        fragment_start = pd.Series(
+            np.where(start_first.le(start_last), start_first + "|" + start_last, start_last + "|" + start_first),
+            index=idx, dtype="object",
+        ).where(start_first.ne("") & start_last.ne(""), "")
+        fragment_end = pd.Series(
+            np.where(end_first.le(end_last), end_first + "|" + end_last, end_last + "|" + end_first),
+            index=idx, dtype="object",
+        ).where(end_first.ne("") & end_last.ne(""), "")
+
+        def relative_bigram_triplet(series: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+            """Compute mid/s2/third bigrams in one pass.
+
+            The old implementation called Series.map() three times for First and
+            three times for Last. At 1M rows that meant millions of Python
+            callbacks. One pass per edge cuts staging overhead substantially
+            without changing any candidate signature.
+            """
+            mids: list[str] = []
+            s2s: list[str] = []
+            thirds: list[str] = []
+            append_mid = mids.append
+            append_s2 = s2s.append
+            append_third = thirds.append
+            for value in series.to_numpy(dtype=object, copy=False):
+                s = str(value or "")
+                length = len(s)
+                if length < 2:
+                    append_mid(s); append_s2(s); append_third(s)
+                    continue
+                max_start = length - 2
+                mid_pos = max(0, min(max_start, length // 2 - 1))
+                s2_pos = min(2, max_start)
+                third_pos = max(0, min(max_start, length // 3))
+                append_mid(s[mid_pos:mid_pos + 2])
+                append_s2(s[s2_pos:s2_pos + 2])
+                append_third(s[third_pos:third_pos + 2])
+            return (
+                pd.Series(mids, index=series.index, dtype="object"),
+                pd.Series(s2s, index=series.index, dtype="object"),
+                pd.Series(thirds, index=series.index, dtype="object"),
+            )
+
+        first_fragments = relative_bigram_triplet(first_token)
+        last_fragments = relative_bigram_triplet(last_token)
+        extra_fragments: list[np.ndarray] = []
+        for ff, lf in zip(first_fragments, last_fragments):
+            pair = pd.Series(
+                np.where(ff.le(lf), ff + "|" + lf, lf + "|" + ff),
+                index=idx,
+                dtype="object",
+            ).where(ff.ne("") & lf.ne(""), "")
+            arr = _stable_block_hash(pair)
+            arr[np.asarray(pair.eq(""))] = 0
+            extra_fragments.append(arr)
+
+        # Reuse b1-b3 for the first three LSH lanes. Weak lead/tail blocks are
+        # no longer needed by the candidate builder. b13-b15 carry LSH 4-6,
+        # b16-b17 carry the start/end fragment rescue lanes.
+        fixed_texts = (ordered_edge, unordered_edge, ordered_head_shape, ordered_tail_shape,
+                       unordered_head_shape, unordered_tail_shape, middle_rescue,
+                       whole_head_shape, whole_tail_shape)
+        fixed_hashes = [_stable_block_hash(x) for x in fixed_texts]
+        for arr, block_text in zip(fixed_hashes, fixed_texts):
+            arr[np.asarray(block_text.fillna("").eq(""))] = 0
+        frag_start_hash = _stable_block_hash(fragment_start); frag_start_hash[np.asarray(fragment_start.eq(""))] = 0
+        frag_end_hash = _stable_block_hash(fragment_end); frag_end_hash[np.asarray(fragment_end.eq(""))] = 0
+
+        block_arrays = [
+            lsh_arrays[0], lsh_arrays[1], lsh_arrays[2],
+            fixed_hashes[0], fixed_hashes[1], fixed_hashes[2], fixed_hashes[3],
+            fixed_hashes[4], fixed_hashes[5], fixed_hashes[6], fixed_hashes[7], fixed_hashes[8],
+            lsh_arrays[3], lsh_arrays[4], lsh_arrays[5], frag_start_hash, frag_end_hash,
+            extra_fragments[0], extra_fragments[1], extra_fragments[2],
+        ]
+    else:
+        block_arrays = [np.zeros(len(chunk), dtype=np.uint64) for _ in range(20)]
+
+    # Persist only identity components explicitly enabled for Dedup scoring.
+    # Raw source values remain in the source CSV/Excel for export and review,
+    # but disabled checkboxes must not silently influence fuzzy classification.
+    match_first = first if use_first else empty.copy()
+    match_middle = middle if use_middle else empty.copy()
+    match_last = last if use_last else empty.copy()
+    match_suffix = suffix if use_suffix else empty.copy()
+
+    return {
+        "name": name, "birth": birth, "first": match_first, "middle": match_middle, "last": match_last, "suffix": match_suffix,
+        "birth_month_component": evidence_month.astype(str),
+        "birth_day_component": evidence_day.astype(str),
+        "birth_year_component": evidence_year.astype(str),
+        "final_key": final_key.astype(str), "swap_key": swap_key.astype(str),
+        "finding": finding, "birth_year": birth_year,
+        **{f"block{i+1}": block_arrays[i] for i in range(20)},
+    }
+
+def _configure_db(conn: sqlite3.Connection, memory_percent: int) -> None:
+    conn.execute("PRAGMA journal_mode=OFF")
+    conn.execute("PRAGMA synchronous=OFF")
+    conn.execute("PRAGMA locking_mode=NORMAL")
+    # Let SQLite parallelize eligible sort/index work. This is an execution
+    # optimization only and never changes which records are compared.
+    try:
+        conn.execute(f"PRAGMA threads={max(1, int(os.cpu_count() or 1))}")
+    except Exception:
+        pass
+    # Large SQLite window functions can create sizable temporary data. Keep it
+    # in RAM only on machines with enough headroom; otherwise let the SSD absorb
+    # the spike instead of risking an out-of-memory crash.
+    if psutil is not None:
+        vm = psutil.virtual_memory()
+        total_mb = int(vm.total / 1024 / 1024)
+        available_mb = int(vm.available / 1024 / 1024)
+        # Large-file stability is more important than keeping the whole SQLite
+        # index in RAM. A 1M-row database can be hundreds of MB; allowing a 2GB
+        # page cache plus Pandas normalization buffers can make a laptop page to
+        # disk or crash. Keep a bounded cache and let the SSD service cold pages.
+        use_memory_temp = memory_percent >= 90 and available_mb >= 8_192
+        conn.execute(f"PRAGMA temp_store={'MEMORY' if use_memory_temp else 'FILE'}")
+        desired_cache_kb = int(
+            total_mb * max(20, min(95, memory_percent)) / 100 * 1024 * 0.08
+        )
+        cache_cap_kb = 131_072 if total_mb >= 24_576 else 65_536  # 128/64 MiB
+        cache_kb = max(32_768, min(desired_cache_kb, cache_cap_kb))
+        conn.execute(f"PRAGMA cache_size=-{cache_kb}")
+        mmap_bytes = min(
+            2 * 1024**3,
+            max(256 * 1024**2, int(vm.available * 0.20)),
+        )
+        conn.execute(f"PRAGMA mmap_size={mmap_bytes}")
+    else:
+        conn.execute("PRAGMA temp_store=FILE")
+        conn.execute("PRAGMA cache_size=-262144")
+        conn.execute("PRAGMA mmap_size=1073741824")
+
+
+def _create_rows_table(conn: sqlite3.Connection, side: str) -> None:
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS rows_{side} (
+            row_id INTEGER PRIMARY KEY,
+            final_key TEXT NOT NULL,
+            swap_key TEXT NOT NULL,
+            fh1 INTEGER NOT NULL,
+            fh2 INTEGER NOT NULL,
+            sh1 INTEGER NOT NULL,
+            sh2 INTEGER NOT NULL,
+            finding INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            birth TEXT NOT NULL,
+            first_name TEXT NOT NULL,
+            middle_name TEXT NOT NULL,
+            last_name TEXT NOT NULL,
+            suffix_name TEXT NOT NULL,
+            birth_month_component TEXT NOT NULL,
+            birth_day_component TEXT NOT NULL,
+            birth_year_component TEXT NOT NULL,
+            byear INTEGER NOT NULL,
+            b1 INTEGER NOT NULL, b2 INTEGER NOT NULL, b3 INTEGER NOT NULL, b4 INTEGER NOT NULL,
+            b5 INTEGER NOT NULL, b6 INTEGER NOT NULL, b7 INTEGER NOT NULL, b8 INTEGER NOT NULL,
+            b9 INTEGER NOT NULL, b10 INTEGER NOT NULL, b11 INTEGER NOT NULL, b12 INTEGER NOT NULL,
+            b13 INTEGER NOT NULL, b14 INTEGER NOT NULL, b15 INTEGER NOT NULL, b16 INTEGER NOT NULL, b17 INTEGER NOT NULL,
+            b18 INTEGER NOT NULL, b19 INTEGER NOT NULL, b20 INTEGER NOT NULL
+        )
+    """)
+
+
+def _u64_to_sql_int(value: int) -> int:
+    return int(np.int64(np.uint64(value).view(np.int64)))
+
+
+def _sql_int_to_u64(value: int) -> np.uint64:
+    return np.int64(value).view(np.uint64)
+
+
+def _write_array(path: Path, values: np.ndarray) -> None:
+    with path.open("ab") as f:
+        np.asarray(values).tofile(f)
+
+
+def stage_input(
+    plan: InputPlan,
+    mapping: ColumnMapping,
+    side: str,
+    temp_root: Path,
+    options: ScaleOptions,
+    log: LogFn,
+    apply_finding: bool,
+) -> StagedFile:
+    hash_dir = temp_root / "arrays"
+    hash_dir.mkdir(parents=True, exist_ok=True)
+    # Excel fast path is a fully verified temporary CSV. Treat it like an
+    # existing CSV source: stage once and reuse it at export without copying.
+    accelerated = plan.accelerated_csv
+    raw_is_source = plan.path.suffix.casefold() == ".csv" or accelerated is not None
+    raw_csv = accelerated or (plan.path if raw_is_source else temp_root / f"raw_{side}.csv")
+    read_plan = (InputPlan(raw_csv, None, 0, plan.headers, ",", "utf-8-sig")
+                 if accelerated is not None else plan)
+    db_path = temp_root / "dedup_index.sqlite"
+    conn = sqlite3.connect(db_path)
+    _configure_db(conn, options.memory_limit_percent)
+    _create_rows_table(conn, side)
+
+    chunk_rows = adaptive_chunk_rows(options.chunk_rows, options.memory_limit_percent, len(plan.headers))
+    log(f"{side.upper()}: streaming with {chunk_rows:,} rows per chunk.")
+    log(f"{side.upper()}: zero-only/template placeholder rows are skipped; zero identity values are treated as missing.")
+    row_id = 0
+    wrote_header = False
+    insert_sql = f"INSERT INTO rows_{side} VALUES ({','.join(['?'] * 38)})"
+    started = time.perf_counter()
+    if raw_is_source:
+        log(f"{side.upper()}: existing CSV reuse enabled; duplicate staging copy skipped.")
+
+    for chunk_no, chunk in enumerate(iter_input_chunks(read_plan, chunk_rows), start=1):
+        chunk = chunk.reindex(columns=plan.headers, fill_value="").fillna("").astype(str)
+        if not raw_is_source:
+            chunk.to_csv(raw_csv, mode="a", header=not wrote_header, index=False, encoding="utf-8", lineterminator="\n")
+            wrote_header = True
+        keys = build_keys(chunk, mapping, apply_finding, min_age=options.min_age, max_age=options.max_age, build_fuzzy_blocks=bool(options.fuzzy))
+        fh1, fh2 = dual_hash(keys["final_key"])
+        sh1, sh2 = dual_hash(keys["swap_key"])
+        count = len(chunk)
+        ids = np.arange(row_id, row_id + count, dtype=np.int64)
+
+        arrays = {
+            "fh1": fh1, "fh2": fh2, "sh1": sh1, "sh2": sh2,
+            "finding": keys["finding"].astype(np.uint16), "byear": keys["birth_year"].astype(np.int16),
+        }
+        for name, arr in arrays.items():
+            _write_array(hash_dir / f"{side}_{name}.bin", arr)
+
+        rows = zip(
+            ids.tolist(), keys["final_key"].tolist(), keys["swap_key"].tolist(),
+            [_u64_to_sql_int(x) for x in fh1], [_u64_to_sql_int(x) for x in fh2],
+            [_u64_to_sql_int(x) for x in sh1], [_u64_to_sql_int(x) for x in sh2],
+            keys["finding"].astype(int).tolist(), keys["name"].tolist(), keys["birth"].tolist(),
+            keys["first"].tolist(), keys["middle"].tolist(), keys["last"].tolist(), keys["suffix"].tolist(),
+            keys["birth_month_component"].tolist(),
+            keys["birth_day_component"].tolist(),
+            keys["birth_year_component"].tolist(),
+            keys["birth_year"].astype(int).tolist(),
+            [_u64_to_sql_int(x) for x in keys["block1"]], [_u64_to_sql_int(x) for x in keys["block2"]],
+            [_u64_to_sql_int(x) for x in keys["block3"]], [_u64_to_sql_int(x) for x in keys["block4"]],
+            [_u64_to_sql_int(x) for x in keys["block5"]],
+            [_u64_to_sql_int(x) for x in keys["block6"]], [_u64_to_sql_int(x) for x in keys["block7"]],
+            [_u64_to_sql_int(x) for x in keys["block8"]], [_u64_to_sql_int(x) for x in keys["block9"]],
+            [_u64_to_sql_int(x) for x in keys["block10"]], [_u64_to_sql_int(x) for x in keys["block11"]],
+            [_u64_to_sql_int(x) for x in keys["block12"]], [_u64_to_sql_int(x) for x in keys["block13"]],
+            [_u64_to_sql_int(x) for x in keys["block14"]], [_u64_to_sql_int(x) for x in keys["block15"]],
+            [_u64_to_sql_int(x) for x in keys["block16"]], [_u64_to_sql_int(x) for x in keys["block17"]],
+            [_u64_to_sql_int(x) for x in keys["block18"]], [_u64_to_sql_int(x) for x in keys["block19"]],
+            [_u64_to_sql_int(x) for x in keys["block20"]],
+        )
+        conn.executemany(insert_sql, rows)
+        conn.commit()
+        row_id += count
+        elapsed = max(time.perf_counter() - started, 0.001)
+        log(f"{side.upper()}: staged {row_id:,} rows ({row_id / elapsed:,.0f} rows/sec).")
+
+        # Large-file memory hygiene. The staging row zip owns several large
+        # Python list iterators produced from the normalized Series. Release
+        # them immediately after SQLite has consumed the batch so a 500K-1M
+        # run does not accumulate multiple chunks of Python object arenas.
+        del rows, arrays, keys, ids, fh1, fh2, sh1, sh2, chunk
+        gc.collect()
+
+    if row_id == 0:
+        conn.close()
+        raise RuntimeError(f"{side.upper()} contains no data rows.")
+
+    log(f"{side.upper()}: building compact verification indexes...")
+    # Cross A-vs-B verification benefits from persistent hash indexes. Within-
+    # file verification already scans rows against an indexed candidate table,
+    # so two additional 500K-1M-row B-trees add export-time pressure without
+    # improving matching coverage. Skip them in File A-only mode.
+    if options.mode == MODE_CROSS:
+        conn.execute(f"CREATE INDEX idx_{side}_fh ON rows_{side}(fh1,fh2)")
+        if options.enable_swap:
+            conn.execute(f"CREATE INDEX idx_{side}_sh ON rows_{side}(sh1,sh2)")
+    if options.fuzzy:
+        # Candidate discovery now uses only strong composite name signatures.
+        # Birthdate is not part of fuzzy discovery and weak b1/b2 indexes are
+        # intentionally omitted to avoid common-surname candidate storms.
+        for col in ("b4", "b5", "b8", "b9", "b10", "b11", "b12"):
+            conn.execute(f"CREATE INDEX idx_{side}_{col} ON rows_{side}({col},row_id)")
+        # v6.27 DOB-assisted discovery: DOB does not decide identity, but exact
+        # DOB + one exact name edge is a highly selective way to discover a
+        # typo on the opposite First/Last component. These indexes support both
+        # Self Dedup and Cross Match without a global DOB gate.
+        conn.execute(f"CREATE INDEX idx_{side}_birth_last ON rows_{side}(birth,last_name,row_id)")
+        conn.execute(f"CREATE INDEX idx_{side}_birth_first ON rows_{side}(birth,first_name,row_id)")
+
+        # Joined/split-name rescue index.
+        #
+        # Example:
+        #   JOHNNY BERT  <->  JOHNNYBERT
+        #   MARY ANN     <->  MARYANN
+        #
+        # `name` is already normalized to lowercase alphanumeric words. This
+        # expression removes only spaces. It is candidate discovery only; the
+        # normal strict scorer and DOB/support rules still make the decision.
+        conn.execute(
+            f"CREATE INDEX idx_{side}_name_compact "
+            f"ON rows_{side}(replace(name,' ',''),row_id)"
+        )
+
+        # Indexed compact phonetic key. This lets candidate discovery combine
+        # spacing changes with conservative spelling changes such as C/K.
+        phon_compact_sql = (
+            "replace("
+            "replace("
+            "replace("
+            "replace("
+            "replace("
+            "replace(name,'q','k'),"
+            "'k','c'),"
+            "'ph','f'),"
+            "'z','s'),"
+            "'v','b'),"
+            "' ','')"
+        )
+        conn.execute(
+            f"CREATE INDEX idx_{side}_name_phon_compact "
+            f"ON rows_{side}({phon_compact_sql},row_id)"
+        )
+    conn.commit()
+    conn.close()
+    return StagedFile(side, raw_csv, row_id, plan.headers, db_path, hash_dir, mapping, plan, raw_is_source)
+
+
+def _structured_keys(h1: np.ndarray, h2: np.ndarray, indexes: np.ndarray | None = None) -> np.ndarray:
+    if indexes is not None:
+        h1 = h1[indexes]; h2 = h2[indexes]
+    out = np.empty(len(h1), dtype=[("a", "<u8"), ("b", "<u8")])
+    out["a"] = h1; out["b"] = h2
+    return out
+
+
+def duplicate_hash_pairs(h1: np.ndarray, h2: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    idx = np.flatnonzero(valid)
+    if len(idx) < 2:
+        return np.empty(0, dtype=[("a", "<u8"), ("b", "<u8")])
+    keys = _structured_keys(h1, h2, idx)
+    order = np.argsort(keys, order=("a", "b"), kind="mergesort")
+    sorted_keys = keys[order]
+    same_prev = np.zeros(len(sorted_keys), dtype=bool)
+    same_prev[1:] = sorted_keys[1:] == sorted_keys[:-1]
+    same_next = np.zeros(len(sorted_keys), dtype=bool)
+    same_next[:-1] = sorted_keys[:-1] == sorted_keys[1:]
+    duplicated = same_prev | same_next
+    if not duplicated.any():
+        return np.empty(0, dtype=keys.dtype)
+    return np.unique(sorted_keys[duplicated])
+
+
+def verify_duplicate_rows(
+    conn: sqlite3.Connection,
+    side: str,
+    hash_pairs: np.ndarray,
+    kind: str,
+    log: LogFn,
+) -> np.ndarray:
+    if len(hash_pairs) == 0:
+        return np.empty(0, dtype=np.int64)
+    table = f"cand_{side}_{kind}"
+    conn.execute(f"DROP TABLE IF EXISTS {table}")
+    conn.execute(f"CREATE TEMP TABLE {table}(h1 INTEGER,h2 INTEGER,PRIMARY KEY(h1,h2)) WITHOUT ROWID")
+    conn.executemany(
+        f"INSERT OR IGNORE INTO {table} VALUES (?,?)",
+        [(_u64_to_sql_int(x["a"]), _u64_to_sql_int(x["b"])) for x in hash_pairs],
+    )
+    if kind == "final":
+        key_col, h1_col, h2_col = "final_key", "fh1", "fh2"
+    else:
+        key_col, h1_col, h2_col = "swap_key", "sh1", "sh2"
+    log(f"Full-key verification: checking {len(hash_pairs):,} {kind} hash groups.")
+    sql = f"""
+        SELECT r.row_id
+        FROM rows_{side} r
+        JOIN {table} c ON r.{h1_col}=c.h1 AND r.{h2_col}=c.h2
+        JOIN (
+            SELECT r2.{key_col} AS k
+            FROM rows_{side} r2
+            JOIN {table} c2 ON r2.{h1_col}=c2.h1 AND r2.{h2_col}=c2.h2
+            WHERE r2.{key_col}<>'' AND (r2.finding & {F_DEDUP_BLOCKING_FINDING})=0
+            GROUP BY r2.{key_col}
+            HAVING COUNT(*)>1
+        ) d ON r.{key_col}=d.k
+        WHERE (r.finding & {F_DEDUP_BLOCKING_FINDING})=0
+        ORDER BY r.row_id
+    """
+    rows = np.fromiter((x[0] for x in conn.execute(sql)), dtype=np.int64)
+    conn.execute(f"DROP TABLE IF EXISTS {table}")
+    return rows
+
+
+def _factorize_hash_groups(h1: np.ndarray, h2: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    group = np.zeros(len(h1), dtype=np.int64)
+    idx = np.flatnonzero(mask)
+    if len(idx) == 0:
+        return group
+    keys = _structured_keys(h1, h2, idx)
+    _, inverse = np.unique(keys, return_inverse=True)
+    group[idx] = inverse.astype(np.int64) + 1
+    return group
+
+
+def classify_within(stage: StagedFile, options: ScaleOptions, temp_root: Path, log: LogFn) -> dict[str, Path]:
+    n = stage.rows
+    fh1 = stage.memmap("fh1", np.uint64, "r")
+    fh2 = stage.memmap("fh2", np.uint64, "r")
+    sh1 = stage.memmap("sh1", np.uint64, "r")
+    sh2 = stage.memmap("sh2", np.uint64, "r")
+    finding_code = stage.memmap("finding", np.uint16, "r+")
+    dedup_allowed = (finding_code & F_DEDUP_BLOCKING_FINDING) == 0
+    valid = dedup_allowed & ((fh1 != 0) | (fh2 != 0))
+
+    type_path = temp_root / "type.bin"
+    group_path = temp_root / "group.bin"
+    score_path = temp_root / "score.bin"
+    matched_path = temp_root / "matched_b.bin"
+    dtype = np.memmap(type_path, dtype=np.uint8, mode="w+", shape=(n,)); dtype[:] = TYPE_CLEAN
+    group = np.memmap(group_path, dtype=np.int64, mode="w+", shape=(n,)); group[:] = 0
+    score = np.memmap(score_path, dtype=np.float32, mode="w+", shape=(n,)); score[:] = 0
+    matched = np.memmap(matched_path, dtype=np.int64, mode="w+", shape=(n,)); matched[:] = -1
+    dtype[finding_code != 0] = TYPE_FINDING
+
+    conn = sqlite3.connect(stage.db_path)
+    _configure_db(conn, options.memory_limit_percent)
+    exact_pairs = duplicate_hash_pairs(fh1, fh2, valid)
+    exact_rows = verify_duplicate_rows(conn, "a", exact_pairs, "final", log)
+    dtype[exact_rows] = TYPE_TRUE; score[exact_rows] = 100
+
+    if options.enable_swap:
+        swap_pairs = duplicate_hash_pairs(sh1, sh2, valid)
+        swap_rows = verify_duplicate_rows(conn, "a", swap_pairs, "swap", log)
+        swap_rows = swap_rows[dtype[swap_rows] == TYPE_CLEAN]
+        dtype[swap_rows] = TYPE_TRUE_SWAP; score[swap_rows] = 100
+    dedup_mask = np.isin(dtype, [TYPE_TRUE, TYPE_TRUE_SWAP])
+    group_key_h1 = sh1 if options.enable_swap else fh1
+    group_key_h2 = sh2 if options.enable_swap else fh2
+    group[:] = _factorize_hash_groups(group_key_h1, group_key_h2, dedup_mask)
+
+    if options.fuzzy:
+        _apply_within_fuzzy(conn, stage, dtype, group, score, matched, finding_code, options, log)
+        _strict_revalidate_within_groups(
+            conn, dtype, group, score, finding_code, options.fuzzy_threshold, log
+        )
+    conn.close()
+    dtype.flush(); group.flush(); score.flush(); matched.flush()
+    return {"type": type_path, "group": group_path, "score": score_path, "matched": matched_path}
+
+
+def _build_unique_hash_index(h1: np.ndarray, h2: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    idx = np.flatnonzero(valid)
+    if len(idx) == 0:
+        return np.empty(0, dtype=[("a", "<u8"), ("b", "<u8")]), np.empty(0, dtype=np.int64)
+    keys = _structured_keys(h1, h2, idx)
+    order = np.argsort(keys, order=("a", "b"), kind="mergesort")
+    sorted_keys = keys[order]
+    sorted_rows = idx[order]
+    first = np.ones(len(sorted_keys), dtype=bool)
+    first[1:] = sorted_keys[1:] != sorted_keys[:-1]
+    return sorted_keys[first], sorted_rows[first]
+
+
+def _lookup_hash_index(h1: np.ndarray, h2: np.ndarray, valid: np.ndarray, keys: np.ndarray, rows: np.ndarray) -> np.ndarray:
+    result = np.full(len(h1), -1, dtype=np.int64)
+    idx = np.flatnonzero(valid)
+    if len(idx) == 0 or len(keys) == 0:
+        return result
+    query = _structured_keys(h1, h2, idx)
+    pos = np.searchsorted(keys, query)
+    in_range = pos < len(keys)
+    good_idx = idx[in_range]
+    good_pos = pos[in_range]
+    equal = keys[good_pos] == query[in_range]
+    result[good_idx[equal]] = rows[good_pos[equal]]
+    return result
+
+
+def _verify_cross_candidates(
+    conn: sqlite3.Connection,
+    candidate_rows: np.ndarray,
+    kind: str,
+    log: LogFn,
+) -> tuple[np.ndarray, np.ndarray]:
+    if len(candidate_rows) == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    conn.execute("DROP TABLE IF EXISTS cand_a")
+    conn.execute("CREATE TEMP TABLE cand_a(row_id INTEGER PRIMARY KEY) WITHOUT ROWID")
+    conn.executemany("INSERT INTO cand_a VALUES (?)", [(int(x),) for x in candidate_rows])
+    if kind == "final":
+        key_col, h1_col, h2_col = "final_key", "fh1", "fh2"
+    else:
+        key_col, h1_col, h2_col = "swap_key", "sh1", "sh2"
+    log(f"Full-key verification: checking {len(candidate_rows):,} Cross {kind} candidates.")
+    sql = f"""
+        SELECT a.row_id, MIN(b.row_id) AS b_row
+        FROM cand_a c
+        JOIN rows_a a ON a.row_id=c.row_id
+        JOIN rows_b b ON a.{h1_col}=b.{h1_col} AND a.{h2_col}=b.{h2_col} AND a.{key_col}=b.{key_col}
+        WHERE (a.finding & {F_DEDUP_BLOCKING_FINDING})=0
+          AND a.{key_col}<>'' AND b.{key_col}<>''
+        GROUP BY a.row_id
+        ORDER BY a.row_id
+    """
+    fetched = list(conn.execute(sql))
+    conn.execute("DROP TABLE IF EXISTS cand_a")
+    if not fetched:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    return np.asarray([x[0] for x in fetched], dtype=np.int64), np.asarray([x[1] for x in fetched], dtype=np.int64)
+
+
+def classify_cross(a: StagedFile, b: StagedFile, options: ScaleOptions, temp_root: Path, log: LogFn) -> dict[str, Path]:
+    n = a.rows
+    afh1 = a.memmap("fh1", np.uint64, "r"); afh2 = a.memmap("fh2", np.uint64, "r")
+    ash1 = a.memmap("sh1", np.uint64, "r"); ash2 = a.memmap("sh2", np.uint64, "r")
+    bfh1 = b.memmap("fh1", np.uint64, "r"); bfh2 = b.memmap("fh2", np.uint64, "r")
+    bsh1 = b.memmap("sh1", np.uint64, "r"); bsh2 = b.memmap("sh2", np.uint64, "r")
+    finding_code = a.memmap("finding", np.uint16, "r+")
+    dedup_allowed = (finding_code & F_DEDUP_BLOCKING_FINDING) == 0
+    avalid = dedup_allowed & ((afh1 != 0) | (afh2 != 0))
+    bvalid = (bfh1 != 0) | (bfh2 != 0)
+
+    type_path = temp_root / "type.bin"; group_path = temp_root / "group.bin"
+    score_path = temp_root / "score.bin"; matched_path = temp_root / "matched_b.bin"
+    dtype = np.memmap(type_path, dtype=np.uint8, mode="w+", shape=(n,)); dtype[:] = TYPE_CLEAN
+    group = np.memmap(group_path, dtype=np.int64, mode="w+", shape=(n,)); group[:] = 0
+    score = np.memmap(score_path, dtype=np.float32, mode="w+", shape=(n,)); score[:] = 0
+    matched = np.memmap(matched_path, dtype=np.int64, mode="w+", shape=(n,)); matched[:] = -1
+    dtype[finding_code != 0] = TYPE_FINDING
+
+    conn = sqlite3.connect(a.db_path)
+    _configure_db(conn, options.memory_limit_percent)
+    exact_keys, exact_ref = _build_unique_hash_index(bfh1, bfh2, bvalid)
+    exact_candidate = _lookup_hash_index(afh1, afh2, avalid, exact_keys, exact_ref)
+    candidate_rows = np.flatnonzero(exact_candidate >= 0)
+    arows, brows = _verify_cross_candidates(conn, candidate_rows, "final", log)
+    dtype[arows] = TYPE_TRUE; score[arows] = 100; matched[arows] = brows
+
+    unmatched = avalid & (dtype == TYPE_CLEAN)
+    if options.enable_swap:
+        swap_keys, swap_ref = _build_unique_hash_index(bsh1, bsh2, (bsh1 != 0) | (bsh2 != 0))
+        swap_candidate = _lookup_hash_index(ash1, ash2, unmatched, swap_keys, swap_ref)
+        candidate_rows = np.flatnonzero(swap_candidate >= 0)
+        arows, brows = _verify_cross_candidates(conn, candidate_rows, "swap", log)
+        dtype[arows] = TYPE_TRUE_SWAP; score[arows] = 100; matched[arows] = brows
+
+    if options.fuzzy:
+        _apply_cross_fuzzy(conn, a, b, dtype, matched, score, finding_code, options, log)
+
+    matched_mask = matched >= 0
+    if matched_mask.any():
+        idx = np.flatnonzero(matched_mask)
+        group[:] = 0
+        # STRICT CROSS GROUPING: one group per actual matched File B row.
+        # This guarantees the reference row displayed in Excel is the exact B
+        # row used for the pairwise score, so an 80% run cannot show a 57%
+        # match merely because another same-family File B row became reference.
+        matched_b_rows = np.asarray(matched[idx], dtype=np.int64)
+        _, inv = np.unique(matched_b_rows, return_inverse=True)
+        group[idx] = inv.astype(np.int64) + 1
+    conn.close()
+    dtype.flush(); group.flush(); score.flush(); matched.flush()
+    return {"type": type_path, "group": group_path, "score": score_path, "matched": matched_path}
+
+
+def _birth_parts(value: str) -> tuple[int, int, int] | None:
+    m = re.fullmatch(r"(\d{2})-(\d{2})-(\d{4})", str(value or ""))
+    if not m:
+        return None
+    try:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    except Exception:
+        return None
+
+
+def birth_similarity(a: str, b: str, cache: dict[str, tuple[int, int, int] | None] | None = None) -> float:
+    if cache is None:
+        pa = _birth_parts(a); pb = _birth_parts(b)
+    else:
+        if a not in cache: cache[a] = _birth_parts(a)
+        if b not in cache: cache[b] = _birth_parts(b)
+        pa = cache[a]; pb = cache[b]
+    if not pa or not pb:
+        return 0.0
+    am, ad, ay = pa; bm, bd, by = pb
+    if pa == pb:
+        return 100.0
+    try:
+        gap = abs((datetime(ay, am, ad) - datetime(by, bm, bd)).days)
+    except Exception:
+        return 0.0
+    score = 0.0
+    if gap <= 7: score = max(score, 96.0)
+    elif gap <= 31 and ay == by: score = max(score, 91.0)
+    elif gap <= 62 and ay == by: score = max(score, 88.0)
+    elif gap <= 93 and ay == by: score = max(score, 84.0)
+    if am == bm and ad == bd and abs(ay - by) <= 1: score = max(score, 96.0)
+    elif am == bm and ad == bd and abs(ay - by) <= 2: score = max(score, 89.0)
+    if ay == by and am == bm and abs(ad - bd) <= 7: score = max(score, 95.0)
+    elif ay == by and am == bm and abs(ad - bd) <= 15: score = max(score, 90.0)
+    if ay == by and ad == bd and abs(am - bm) <= 1: score = max(score, 93.0)
+    if ay == by and am == bd and ad == bm: score = max(score, 92.0)
+    return score
+
+
+_SUFFIX_TOKENS = frozenset({"jr", "sr", "ii", "iii", "iv", "v", "junior", "senior"})
+
+
+def _fuzzy_phon(value: str) -> str:
+    text = str(value or "").casefold().replace("q", "k").replace("k", "c")
+    return text.replace("ph", "f").replace("z", "s").replace("v", "b")
+
+
+def _compact_phonetic_name_key(value: str) -> str:
+    """Exact candidate key for joined/split + conservative spelling variants."""
+    text = strip_accents(str(value or "")).casefold()
+    text = re.sub(r"[^0-9a-z]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return _fuzzy_phon(text).replace(" ", "")
+
+
+def _fuzzy_features(value: str, cache: dict[str, tuple[str, str, str, tuple[str, ...]]]) -> tuple[str, str, str, tuple[str, ...]]:
+    text = str(value or "")
+    cached = cache.get(text)
+    if cached is not None:
+        return cached
+    phon = _fuzzy_phon(text)
+    compact = phon.replace(" ", "")
+    tokens = tuple(x for x in phon.split() if len(x) > 1 and x not in _SUFFIX_TOKENS)
+    sorted_text = "".join(sorted(phon.split()))
+    result = (phon, compact, sorted_text, tokens)
+    cache[text] = result
+    return result
+
+
+def _close_component_score(
+    a: str,
+    b: str,
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]],
+    *,
+    initial_aware: bool = False,
+) -> float:
+    a = str(a or "").strip()
+    b = str(b or "").strip()
+    if not a or not b:
+        return 0.0
+    ac = re.sub(r"\s+", "", a)
+    bc = re.sub(r"\s+", "", b)
+    if initial_aware:
+        if len(ac) == 1 and bc.startswith(ac):
+            return 100.0
+        if len(bc) == 1 and ac.startswith(bc):
+            return 100.0
+        # Middle initials such as "M L" vs "Maria Lopez".
+        a_initials = "".join(x[:1] for x in a.split() if x)
+        b_initials = "".join(x[:1] for x in b.split() if x)
+        if a_initials and b_initials and (a_initials == b_initials):
+            if all(len(x) <= 2 for x in a.split()) or all(len(x) <= 2 for x in b.split()):
+                return 100.0
+    ap = _fuzzy_features(a, feature_cache)[0]
+    bp = _fuzzy_features(b, feature_cache)[0]
+    return float(max(
+        fuzz.ratio(a, b), fuzz.WRatio(a, b),
+        fuzz.ratio(ap, bp), fuzz.WRatio(ap, bp),
+    ))
+
+
+_SUFFIX_CANON = {
+    "jr": "jr", "junior": "jr", "j": "jr",
+    "sr": "sr", "senior": "sr", "s": "sr",
+    "ii": "ii", "2": "ii", "2nd": "ii",
+    "iii": "iii", "3": "iii", "3rd": "iii",
+    "iv": "iv", "4": "iv", "4th": "iv",
+    "v": "v", "5": "v", "5th": "v",
+}
+
+
+def _canonical_suffix(value: str) -> str:
+    raw = re.sub(r"[^0-9a-z]+", "", strip_accents(str(value or "")).casefold())
+    return _SUFFIX_CANON.get(raw, raw)
+
+
+def _optional_middle_score(
+    a: str,
+    b: str,
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]],
+) -> tuple[bool, float]:
+    """Middle is optional when absent, but part of the core when both exist."""
+    a = str(a or "").strip(); b = str(b or "").strip()
+    if not a or not b:
+        return False, 0.0
+    return True, _close_component_score(a, b, feature_cache, initial_aware=True)
+
+
+def _optional_suffix_compatible(a: str, b: str) -> tuple[bool, bool]:
+    """Suffix is optional when absent. If both exist, they must agree canonically."""
+    a = _canonical_suffix(a); b = _canonical_suffix(b)
+    if not a or not b:
+        return False, True
+    return True, a == b
+
+
+def _suffix_similarity_score(a: str, b: str) -> float | None:
+    ca = _canonical_suffix(a)
+    cb = _canonical_suffix(b)
+    if not ca or not cb:
+        return None
+    return 100.0 if ca == cb else 0.0
+
+
+def _middle_initial_signature(value: str) -> tuple[str, bool]:
+    """Return initials and whether the value is genuinely initial-style.
+
+    Examples: "M" and "M L" are initial-style; "MARIA" is not.
+    This prevents a broad WRatio/substring score from making unrelated full
+    middle names look stronger than they really are.
+    """
+    tokens = [x.casefold() for x in str(value or "").split() if x]
+    if not tokens:
+        return "", False
+    cleaned = [re.sub(r"[^a-z0-9]", "", x) for x in tokens]
+    cleaned = [x for x in cleaned if x]
+    if not cleaned:
+        return "", False
+    initial_style = all(len(x) <= 2 for x in cleaned)
+    initials = "".join(x[:1] for x in cleaned)
+    return initials, bool(initial_style and initials)
+
+
+def _secondary_edit_similarity(a: str, b: str) -> float:
+    """Additional typo evidence: Jaro-Winkler + OSA normalized similarity.
+
+    These metrics improve transposition/edit capture (MICHAEL/MICHEAL,
+    DELORIA/DELORYA) but are never allowed to override the short-prefix
+    collision guard used for identity names.
+    """
+    a = str(a or "").strip()
+    b = str(b or "").strip()
+    if not a or not b:
+        return 0.0
+    try:
+        jw = float(JaroWinkler.normalized_similarity(a, b)) * 100.0
+    except Exception:
+        jw = 0.0
+    try:
+        osa = float(OSA.normalized_similarity(a, b)) * 100.0
+    except Exception:
+        osa = 0.0
+    return max(jw, osa)
+
+
+def _strict_middle_component_score(
+    a: str,
+    b: str,
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]],
+) -> float:
+    """Precision-first Middle Name similarity.
+
+    Rules:
+    - Exact middle names = 100.
+    - Missing is handled by the caller as N/A.
+    - A true initial form may match the initials of a full middle name.
+    - Full-word comparison deliberately avoids WRatio/token_set_ratio because
+      substring containment (for example, "DELA CRUZ" vs "CRUZ") can create
+      false positives in identity data.
+    - Conservative phonetic normalization still rescues common spelling noise
+      such as SANTOS/SANTOZ.
+    """
+    a = str(a or "").strip()
+    b = str(b or "").strip()
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 100.0
+
+    a_initials, a_is_initial = _middle_initial_signature(a)
+    b_initials, b_is_initial = _middle_initial_signature(b)
+    if a_is_initial != b_is_initial:
+        short_initials = a_initials if a_is_initial else b_initials
+        full_value = (b if a_is_initial else a).casefold()
+        full_initials = "".join(x[:1] for x in full_value.split() if x)
+        if short_initials and full_initials.startswith(short_initials):
+            return float(MIDDLE_INITIAL_COMPATIBILITY_SCORE)
+    elif a_is_initial and b_is_initial and a_initials == b_initials:
+        return float(MIDDLE_INITIAL_COMPATIBILITY_SCORE)
+
+    ap = _fuzzy_features(a, feature_cache)[0]
+    bp = _fuzzy_features(b, feature_cache)[0]
+    return float(max(
+        fuzz.ratio(a, b),
+        fuzz.QRatio(a, b),
+        fuzz.token_sort_ratio(a, b),
+        fuzz.ratio(ap, bp),
+        fuzz.QRatio(ap, bp),
+        fuzz.token_sort_ratio(ap, bp),
+        _secondary_edit_similarity(a, b),
+        _secondary_edit_similarity(ap, bp),
+    ))
+
+
+def _strict_identity_component_score(
+    a: str,
+    b: str,
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]],
+) -> float:
+    """Precision-first First/Last similarity for identity matching.
+
+    WRatio is intentionally excluded here. WRatio is excellent for search, but
+    it rewards containment and can make different identity values look too
+    similar (JOSE/JOSEPH, DELA CRUZ/CRUZ, AL/ALI). This scorer keeps typo and
+    conservative phonetic rescue while requiring the complete component to be
+    similar.
+    """
+    a = str(a or "").strip()
+    b = str(b or "").strip()
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 100.0
+    ap = _fuzzy_features(a, feature_cache)[0]
+    bp = _fuzzy_features(b, feature_cache)[0]
+    ac = re.sub(r"\s+", "", a)
+    bc = re.sub(r"\s+", "", b)
+    apc = re.sub(r"\s+", "", ap)
+    bpc = re.sub(r"\s+", "", bp)
+    lexical = float(max(
+        fuzz.ratio(a, b),
+        fuzz.QRatio(a, b),
+        fuzz.token_sort_ratio(a, b),
+        fuzz.ratio(ac, bc),
+        _secondary_edit_similarity(a, b),
+        _secondary_edit_similarity(ac, bc),
+    ))
+    phonetic = float(max(
+        fuzz.ratio(ap, bp),
+        fuzz.QRatio(ap, bp),
+        fuzz.token_sort_ratio(ap, bp),
+        fuzz.ratio(apc, bpc),
+        _secondary_edit_similarity(ap, bp),
+        _secondary_edit_similarity(apc, bpc),
+    ))
+
+    # Prefix containment is a known false-positive pattern in identity data:
+    # ANN/ANNA, AL/ALI, JOSE/JOSEPH. With the new 80% minimum dedup floor, cap
+    # these below 80 so a containment relationship alone can never auto-merge.
+    if _short_prefix_extension_collision(ac, bc):
+        return min(max(lexical, phonetic), float(MIN_DEDUP_FUZZY_THRESHOLD) - 1.0)
+
+    # Very short identity fields contain little entropy. A phonetic collision
+    # such as MARK/MARC must not jump from lexical similarity to 100% auto
+    # confidence. For <=4 characters, phonetics remain discovery evidence only.
+    min_len = min(len(ac), len(bc))
+    if min_len <= 4:
+        return lexical
+
+    return max(lexical, phonetic)
+
+
+def _component_similarity_score(
+    a: str,
+    b: str,
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]],
+    *,
+    middle: bool = False,
+    suffix: bool = False,
+) -> float | None:
+    """Actual fuzzy similarity for one mapped component. Missing = N/A, never 0%."""
+    a = str(a or "").strip()
+    b = str(b or "").strip()
+    if not a or not b:
+        return None
+    if suffix:
+        return _suffix_similarity_score(a, b)
+    if middle:
+        return _strict_middle_component_score(a, b, feature_cache)
+    return _strict_identity_component_score(a, b, feature_cache)
+
+
+def _name_component_profile(
+    af: str, am: str, al: str, asu: str,
+    bf: str, bm: str, bl: str, bsu: str,
+    *,
+    swap: bool = False,
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]] | None = None,
+) -> dict[str, Any]:
+    """Compare mapped name components. Missing components are N/A and excluded from the average."""
+    cache = feature_cache if feature_cache is not None else {}
+    if swap:
+        first_label = "First↔Last"
+        last_label = "Last↔First"
+        first_score = _component_similarity_score(af, bl, cache)
+        last_score = _component_similarity_score(al, bf, cache)
+    else:
+        first_label = "First"
+        last_label = "Last"
+        first_score = _component_similarity_score(af, bf, cache)
+        last_score = _component_similarity_score(al, bl, cache)
+    middle_score = _component_similarity_score(am, bm, cache, middle=True)
+    suffix_score = _component_similarity_score(asu, bsu, cache, suffix=True)
+    components = [
+        (first_label, first_score, "first"),
+        ("Middle", middle_score, "middle"),
+        (last_label, last_score, "last"),
+        ("Suffix", suffix_score, "suffix"),
+    ]
+    usable=[float(s) for _l,s,_k in components if s is not None]
+    identity=[float(s) for _l,s,k in components if k in {"first","middle","last"} and s is not None]
+    anchors=[float(s) for _l,s,k in components if k in {"first","last"} and s is not None]
+    return {
+        "components": components,
+        "average": float(sum(usable)/len(usable)) if usable else 0.0,
+        "compared": len(usable),
+        "identity_compared": len(identity),
+        "anchor_compared": len(anchors),
+    }
+
+
+def _profile_is_semantically_exact(
+    profile: dict[str, Any],
+    *,
+    middle_a: str = "", middle_b: str = "",
+    suffix_a: str = "", suffix_b: str = "",
+) -> bool:
+    """True only when the complete available structured name agrees exactly.
+
+    First and Last must both score 100. If Middle or Suffix is present on either
+    side, it must be present on both and also score 100. This keeps exact
+    promotion conservative and prevents a missing middle name from becoming a
+    TRUE_DUPLICATE merely because the remaining fields are equal.
+    """
+    by_key = {key: score for _label, score, key in profile.get("components", [])}
+    for key in ("first", "last"):
+        score = by_key.get(key)
+        if score is None or float(score) < 100.0:
+            return False
+    if bool(str(middle_a or "").strip()) or bool(str(middle_b or "").strip()):
+        if not (str(middle_a or "").strip() and str(middle_b or "").strip()):
+            return False
+        score = by_key.get("middle")
+        if score is None or float(score) < 100.0:
+            return False
+    if bool(str(suffix_a or "").strip()) or bool(str(suffix_b or "").strip()):
+        if not (str(suffix_a or "").strip() and str(suffix_b or "").strip()):
+            return False
+        score = by_key.get("suffix")
+        if score is None or float(score) < 100.0:
+            return False
+    return True
+
+
+def _profile_accepts(profile: dict[str, Any], threshold: int) -> bool:
+    """Accuracy-first structured-name gate.
+
+    First and Last are mandatory anchors for structured fuzzy matching. Middle
+    is optional only when missing on either side. If both middle names exist,
+    they must clear a dedicated conservative floor. Suffix, when present on
+    both sides, must agree exactly through canonical suffix normalization.
+
+    The configured fuzzy threshold still controls First, Last and the overall
+    Name Similarity Rate. DOB remains support/warning evidence only.
+    """
+    floor = float(max(MIN_DEDUP_FUZZY_THRESHOLD, min(100, int(threshold))))
+    by_key = {key: score for _label, score, key in profile["components"]}
+    first_score = by_key.get("first")
+    last_score = by_key.get("last")
+    middle_score = by_key.get("middle")
+    suffix_score = by_key.get("suffix")
+
+    # Do not auto-deduplicate structured records when either core edge name is
+    # unavailable. This closes the v6.17 First+Middle / Middle+Last bypass.
+    if first_score is None or last_score is None:
+        return False
+    if float(first_score) < floor or float(last_score) < floor:
+        return False
+
+    # Missing middle = unknown, not conflict. Both available = real evidence.
+    if middle_score is not None and float(middle_score) < float(MIDDLE_FULLWORD_MIN_SIMILARITY):
+        return False
+
+    # Canonical suffix scorer returns 100 for compatible and 0 for conflict.
+    if suffix_score is not None and float(suffix_score) < 100.0:
+        return False
+
+    return float(profile["average"]) >= floor
+
+
+def _profile_is_borderline_review(profile: dict[str, Any], threshold: int) -> bool:
+    """Conservative near-threshold identity evidence for manual review only."""
+    floor = float(max(MIN_DEDUP_FUZZY_THRESHOLD, min(100, int(threshold))))
+    by_key = {key: score for _label, score, key in profile["components"]}
+    first_score = by_key.get("first"); last_score = by_key.get("last")
+    middle_score = by_key.get("middle"); suffix_score = by_key.get("suffix")
+    if first_score is None or last_score is None:
+        return False
+    if float(first_score) < max(70.0, floor - 3.0) or float(last_score) < max(70.0, floor - 3.0):
+        return False
+    if middle_score is not None and float(middle_score) < float(MIDDLE_FULLWORD_MIN_SIMILARITY):
+        return False
+    if suffix_score is not None and float(suffix_score) < 100.0:
+        return False
+    return float(profile.get("average", 0.0)) >= max(70.0, floor - 2.0)
+
+
+def _profile_rate(profile: dict[str, Any]) -> float:
+    return round(float(profile.get("average",0.0)),1)
+
+
+def _format_component_rate(score: float | None) -> str:
+    return "N/A" if score is None else f"{float(score):.1f}%"
+
+
+def _date_aware_birth_component_score(kind: str, a: int | str | None, b: int | str | None) -> float | None:
+    """Date-aware similarity for matching DOB components.
+
+    Missing on either side = N/A.
+
+    Month:
+      same 100
+      +/-1 month 75
+      +/-2 months 50
+      farther 0
+      Month distance is circular, so December vs January is +/-1.
+
+    Day:
+      same 100
+      +/-1 day 90
+      +/-2..3 days 75
+      +/-4..7 days 50
+      farther 0
+
+    Year:
+      same 100
+      +/-1 year 90
+      +/-2 years 80
+      +/-3..5 years 50
+      farther 0
+    """
+    try:
+        if a is None or b is None or str(a).strip() == "" or str(b).strip() == "":
+            return None
+        av = int(a)
+        bv = int(b)
+    except Exception:
+        return None
+
+    kind = str(kind or "").casefold()
+    if kind == "month":
+        if not (1 <= av <= 12 and 1 <= bv <= 12):
+            return None
+        raw = abs(av - bv)
+        diff = min(raw, 12 - raw)
+        if diff == 0:
+            return 100.0
+        if diff == 1:
+            return 75.0
+        if diff == 2:
+            return 50.0
+        return 0.0
+
+    if kind == "day":
+        if not (1 <= av <= 31 and 1 <= bv <= 31):
+            return None
+        diff = abs(av - bv)
+        if diff == 0:
+            return 100.0
+        if diff == 1:
+            return 90.0
+        if diff <= 3:
+            return 75.0
+        if diff <= 7:
+            return 50.0
+        return 0.0
+
+    if kind == "year":
+        if not (1000 <= av <= 9999 and 1000 <= bv <= 9999):
+            return None
+        diff = abs(av - bv)
+        if diff == 0:
+            return 100.0
+        if diff == 1:
+            return 90.0
+        if diff == 2:
+            return 80.0
+        if diff <= 5:
+            return 50.0
+        return 0.0
+
+    return None
+
+
+def _birth_components_from_full_birth(value: str) -> tuple[str, str, str]:
+    parts = _birth_parts(str(value or ""))
+    if not parts:
+        return "", "", ""
+    month, day, year = parts
+    return f"{month:02d}", f"{day:02d}", f"{year:04d}"
+
+
+def _birth_component_profile_from_components(
+    a_components: tuple[str, str, str],
+    b_components: tuple[str, str, str],
+) -> dict[str, Any]:
+    """Month->Month, Day->Day, Year->Year evidence.
+
+    Missing components are N/A and excluded from the DOB average.
+    """
+    am, ad, ay = (str(x or "").strip() for x in a_components)
+    bm, bd, by = (str(x or "").strip() for x in b_components)
+
+    components = [
+        ("Month", _date_aware_birth_component_score("month", am, bm)),
+        ("Day", _date_aware_birth_component_score("day", ad, bd)),
+        ("Year", _date_aware_birth_component_score("year", ay, by)),
+    ]
+    usable = [float(score) for _label, score in components if score is not None]
+    average = (sum(usable) / len(usable)) if usable else None
+    return {
+        "components": components,
+        "average": average,
+        "compared": len(usable),
+    }
+
+
+def _birth_component_profile(a_birth: str, b_birth: str) -> dict[str, Any]:
+    """Compatibility wrapper for complete normalized DOB strings."""
+    return _birth_component_profile_from_components(
+        _birth_components_from_full_birth(a_birth),
+        _birth_components_from_full_birth(b_birth),
+    )
+
+
+def _birth_profile_rate(profile: dict[str, Any]) -> float | None:
+    value = profile.get("average")
+    return None if value is None else round(float(value), 1)
+
+
+def _overall_similarity(name_rate: float, birth_rate: float | None) -> float:
+    """Overall evidence: NAME 75% + DOB 25%.
+
+    The selected threshold applies to OverallSimilarity.
+    Existing identity checks still require sufficient name evidence.
+
+    If no usable DOB component can be compared, Overall = Name.
+    """
+    if birth_rate is None:
+        return round(float(name_rate), 1)
+    return round(float(name_rate) * 0.75 + float(birth_rate) * 0.25, 1)
+
+
+def _format_birth_rate(score: float | None) -> str:
+    return "N/A" if score is None else f"{float(score):.1f}%"
+
+
+def _birth_components_from_row(row: Any, mapping: ColumnMapping) -> tuple[str, str, str]:
+    """Extract normalized Month/Day/Year independently from a raw source row.
+
+    Split DOB fields are preferred. A complete Birthdate column can fill any
+    missing split component. This preserves partial DOB evidence.
+    """
+    month = day = year = ""
+
+    if mapping.birth_month:
+        month = str(normalize_month_series(pd.Series([_row_cell(row, mapping.birth_month)])).iloc[0] or "")
+    if mapping.birth_day:
+        day = str(normalize_day_series(pd.Series([_row_cell(row, mapping.birth_day)])).iloc[0] or "")
+    if mapping.birth_year:
+        year = str(normalize_year_series(pd.Series([_row_cell(row, mapping.birth_year)])).iloc[0] or "")
+
+    if mapping.birthdate:
+        normalized, _invalid, _ambiguous, _future, _under, _old = normalize_birthdate_series(
+            pd.Series([_row_cell(row, mapping.birthdate)]), min_age=0, max_age=0
+        )
+        fm, fd, fy = _birth_components_from_full_birth(str(normalized.iloc[0] or ""))
+        month = month or fm
+        day = day or fd
+        year = year or fy
+
+    return month, day, year
+
+
+def _format_birth_summary(profile: dict[str, Any]) -> str:
+    rate = _birth_profile_rate(profile)
+    compared = int(profile.get("compared", 0))
+    if rate is None:
+        return "N/A"
+    return f"{rate:.1f}% ({compared}/3)"
+
+
+
+
+def _name_component_scores(
+    af: str,
+    al: str,
+    bf: str,
+    bl: str,
+    atokens: tuple[str, ...],
+    btokens: tuple[str, ...],
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]],
+) -> tuple[float, float, float, float, float, float]:
+    """Return First/Last same-order and swap-order scores."""
+    af = str(af or ""); al = str(al or ""); bf = str(bf or ""); bl = str(bl or "")
+    if not af and atokens: af = atokens[0]
+    if not al and atokens: al = atokens[-1]
+    if not bf and btokens: bf = btokens[0]
+    if not bl and btokens: bl = btokens[-1]
+    same_first = _close_component_score(af, bf, feature_cache)
+    same_last = _close_component_score(al, bl, feature_cache)
+    cross_first = _close_component_score(af, bl, feature_cache)
+    cross_last = _close_component_score(al, bf, feature_cache)
+    same_has_both = bool(af and bf and al and bl)
+    cross_has_both = bool(af and bl and al and bf)
+    same_avg = (same_first + same_last) / 2.0 if same_has_both else max(same_first, same_last)
+    cross_avg = (cross_first + cross_last) / 2.0 if cross_has_both else max(cross_first, cross_last)
+    return same_first, same_last, cross_first, cross_last, same_avg, cross_avg
+
+
+def _looks_swap_tokens(
+    at: tuple[str, ...], bt: tuple[str, ...],
+    same_first: float = 0.0, same_last: float = 0.0,
+    cross_first: float = 0.0, cross_last: float = 0.0,
+) -> bool:
+    if len(at) < 2 or len(bt) < 2:
+        return False
+    same_avg = (same_first + same_last) / 2.0
+    cross_avg = (cross_first + cross_last) / 2.0
+    explicit_cross = cross_first >= 68.0 and cross_last >= 68.0 and cross_avg >= same_avg + 6.0
+    token_cross = (
+        fuzz.ratio(at[0], bt[-1]) >= 72 and fuzz.ratio(at[-1], bt[0]) >= 72
+        and (fuzz.ratio(at[0], bt[0]) < 85 or fuzz.ratio(at[-1], bt[-1]) < 85)
+    )
+    return bool(explicit_cross or token_cross)
+
+
+def _component_guard_from_scores(
+    first_score: float, last_score: float, threshold: int, birth_score: float, structured: bool,
+) -> bool:
+    """First and Last are mandatory fuzzy anchors. Birthdate never blocks."""
+    if not structured:
+        return True
+    if first_score <= 0.0 or last_score <= 0.0:
+        return False
+    threshold = max(0, min(100, int(threshold)))
+    weak_floor = max(65.0, float(threshold) - 5.0)
+    anchor_floor = max(75.0, min(100.0, float(threshold) + 5.0))
+    return min(first_score, last_score) >= weak_floor and max(first_score, last_score) >= anchor_floor
+
+
+def _token_alignment_count_tokens(at: tuple[str, ...], bt: tuple[str, ...], floor: float = 74.0) -> int:
+    if not at or not bt: return 0
+    unused = set(range(len(bt))); matched = 0
+    for token in at:
+        best_j = -1; best = 0.0
+        for j in tuple(unused):
+            value = max(fuzz.ratio(token, bt[j]), fuzz.ratio(_fuzzy_phon(token), _fuzzy_phon(bt[j])))
+            if value > best: best = value; best_j = j
+        if best_j >= 0 and best >= floor:
+            unused.remove(best_j); matched += 1
+    return matched
+
+
+def _unordered_token_alignment_score(at: tuple[str, ...], bt: tuple[str, ...]) -> float:
+    if not at or not bt: return 0.0
+    short, long = (at, bt) if len(at) <= len(bt) else (bt, at)
+    unused = set(range(len(long))); scores: list[float] = []
+    for token in short:
+        options = [(float(max(fuzz.ratio(token, long[j]), fuzz.ratio(_fuzzy_phon(token), _fuzzy_phon(long[j])))), j) for j in unused]
+        if not options: break
+        best, best_j = max(options); scores.append(best); unused.remove(best_j)
+    if len(scores) < min(2, len(short)): return 0.0
+    return float(sum(scores) / len(scores))
+
+
+
+def _full_name_core_tokens(value: str) -> tuple[list[str], str]:
+    """Split normalized Full Name into core tokens plus canonical trailing suffix."""
+    tokens = [x for x in str(value or "").split() if x]
+    suffix = ""
+    if tokens:
+        canon = _canonical_suffix(tokens[-1])
+        if canon in {"jr", "sr", "ii", "iii", "iv", "v"}:
+            suffix = canon
+            tokens = tokens[:-1]
+    return tokens, suffix
+
+
+def _short_prefix_extension_collision(a: str, b: str) -> bool:
+    """Risky distinct-name pattern such as ANN/ANNA, AL/ALI, JOSE/JOSEPH.
+
+    Search metrics often score these too highly because one complete short name
+    is contained in the other. Keep them out of automatic Full Name matches.
+    """
+    a = re.sub(r"[^0-9a-z]+", "", str(a or "").casefold())
+    b = re.sub(r"[^0-9a-z]+", "", str(b or "").casefold())
+    if not a or not b or a == b:
+        return False
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) > 5:
+        return False
+    return bool(long.startswith(short) and 1 <= len(long) - len(short) <= 4)
+
+
+def _short_phonetic_equivalent(a: str, b: str) -> bool:
+    """Short spelling variants with equal conservative phonetic form.
+
+    This is Review evidence, not a blanket automatic-duplicate rule. Examples
+    include CARL/KARL and MARK/MARC.
+    """
+    a = re.sub(r"[^0-9a-z]+", "", str(a or "").casefold())
+    b = re.sub(r"[^0-9a-z]+", "", str(b or "").casefold())
+    if not a or not b or a == b:
+        return False
+    if min(len(a), len(b)) > 5:
+        return False
+    lexical = float(max(fuzz.ratio(a, b), fuzz.QRatio(a, b)))
+    return lexical >= 70.0 and _fuzzy_phon(a) == _fuzzy_phon(b)
+
+
+def _full_name_support_decision(
+    a_name: str,
+    b_name: str,
+    threshold: int,
+    birth_rate: float | None,
+    birth_compared: int,
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]],
+) -> tuple[str, float]:
+    """Precision-first structural hint for Full Name-only records.
+
+    Returns:
+      ("auto", rate)   strong token structure can safely promote a fuzzy pair
+      ("review", rate) plausible identity evidence but not enough for automation
+      ("reject", rate) explicit suffix conflict
+      ("none", rate)   fall back to normal full-name scorer
+
+    This helper deliberately avoids guessing nicknames. Short/long name forms
+    with omitted interior names are surfaced for Review when DOB supports them.
+    """
+    floor = float(max(MIN_DEDUP_FUZZY_THRESHOLD, min(100, int(threshold))))
+    at, asuf = _full_name_core_tokens(a_name)
+    bt, bsuf = _full_name_core_tokens(b_name)
+
+    if asuf and bsuf and asuf != bsuf:
+        return "reject", 0.0
+
+    # Punctuation and spacing can split one written name into different token
+    # counts (O'CONNOR vs OCONNOR, D'ANGELO vs DANGELO). If the suffix-free
+    # core is exactly equal after removing spaces, it is formatting noise.
+    a_core_compact = "".join(at)
+    b_core_compact = "".join(bt)
+    if a_core_compact and a_core_compact == b_core_compact:
+        return "auto", 100.0
+
+    if len(at) < 2 or len(bt) < 2:
+        return "none", 0.0
+
+    dob_support = (
+        birth_rate is not None
+        and int(birth_compared) >= 2
+        and float(birth_rate) >= 80.0
+    )
+
+    # Same-order edge anchors. These use the strict identity scorer, not WRatio.
+    first_score = _strict_identity_component_score(at[0], bt[0], feature_cache)
+    last_score = _strict_identity_component_score(at[-1], bt[-1], feature_cache)
+    anchor_rate = round((float(first_score) + float(last_score)) / 2.0, 1)
+
+    # Guard against containment-style false positives when the other name
+    # tokens line up. Examples: ANN LEE / ANNA LEE, JOSE REYES / JOSEPH REYES.
+    if len(at) == len(bt):
+        prefix_collision = False
+        aligned_other = 0
+        for i, (x, y) in enumerate(zip(at, bt)):
+            if _short_prefix_extension_collision(x, y):
+                prefix_collision = True
+            else:
+                score = _strict_middle_component_score(x, y, feature_cache)
+                if score >= max(85.0, floor - 5.0):
+                    aligned_other += 1
+        if prefix_collision and aligned_other >= max(1, len(at) - 1):
+            return ("review" if dob_support else "reject"), max(anchor_rate, floor - 1.0)
+
+    # Short conservative phonetic collisions need corroboration. Detect them,
+    # but do not let the phonetic transform alone create an automatic duplicate.
+    short_phon_first = _short_phonetic_equivalent(at[0], bt[0])
+    short_phon_last = _short_phonetic_equivalent(at[-1], bt[-1])
+    if (short_phon_first and last_score >= floor) or (short_phon_last and first_score >= floor):
+        if dob_support:
+            return "review", max(anchor_rate, floor - 1.0)
+
+    # Supported one-anchor spelling typo: preserve as Review. This avoids
+    # losing plausible records such as ALEXANDER/ALEKSANDER when the surname
+    # and DOB agree, without lowering the automatic duplicate threshold.
+    near_floor = max(74.0, floor - 18.0)
+    if dob_support and (
+        (near_floor <= first_score < floor and last_score >= floor)
+        or (near_floor <= last_score < floor and first_score >= floor)
+    ):
+        return "review", max(anchor_rate, floor - 1.0)
+
+    if first_score >= floor and last_score >= floor:
+        ai = at[1:-1]
+        bi = bt[1:-1]
+
+        # Exact core edges with canonical suffix aliases are safe when DOB is
+        # available, or when there are compatible interior names.
+        if not ai and not bi:
+            if asuf or bsuf:
+                if (not asuf or not bsuf or asuf == bsuf) and dob_support:
+                    return "auto", 100.0
+            return "none", anchor_rate
+
+        if len(ai) == len(bi):
+            interior_scores = [
+                _strict_middle_component_score(x, y, feature_cache)
+                for x, y in zip(ai, bi)
+            ]
+            if interior_scores and min(interior_scores) >= float(MIDDLE_FULLWORD_MIN_SIMILARITY):
+                rate = round(
+                    (float(first_score) + float(last_score) + sum(interior_scores))
+                    / (2.0 + len(interior_scores)),
+                    1,
+                )
+                # Initial-to-full interior names are strong evidence, especially
+                # with matching DOB. Example JUAN M REYES / JUAN MIGUEL REYES.
+                if dob_support or rate >= floor:
+                    return "auto", max(rate, floor)
+
+        # One record has fewer/more interior names. Never silently call it Clean
+        # when First+Last+DOB strongly agree; route it to Review.
+        if dob_support:
+            return "review", max(anchor_rate, floor - 1.0)
+
+    return "none", anchor_rate
+
+
+
+def _name_initial_signature(value: str) -> tuple[str, bool]:
+    tokens = [re.sub(r"[^0-9a-z]", "", x.casefold()) for x in str(value or "").split()]
+    tokens = [x for x in tokens if x]
+    if not tokens:
+        return "", False
+    # A single two-letter token such as AL is usually a real short name, not
+    # two initials. Treat initials as either one-letter tokens or multiple
+    # short tokens such as "J P".
+    initial_style = all(len(x) == 1 for x in tokens) or (
+        len(tokens) >= 2 and all(len(x) <= 2 for x in tokens)
+    )
+    return "".join(x[:1] for x in tokens), bool(initial_style)
+
+
+def _initial_vs_full_name_component(a: str, b: str) -> bool:
+    """True for an explicit initial form matching a full name's initials."""
+    ai, a_initial = _name_initial_signature(a)
+    bi, b_initial = _name_initial_signature(b)
+    if not ai or not bi or a_initial == b_initial:
+        return False
+    short = ai if a_initial else bi
+    full_value = b if a_initial else a
+    full_initials = "".join(
+        re.sub(r"[^0-9a-z]", "", x.casefold())[:1]
+        for x in str(full_value or "").split()
+        if re.sub(r"[^0-9a-z]", "", x.casefold())
+    )
+    return bool(short and full_initials and full_initials.startswith(short))
+
+
+def _structured_initial_review(
+    af: str, am: str, al: str, asu: str,
+    bf: str, bm: str, bl: str, bsu: str,
+    threshold: int,
+    birth_rate: float | None,
+    birth_compared: int,
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]],
+    *,
+    swap: bool = False,
+) -> bool:
+    """Detect First/Last initials conservatively as Review evidence."""
+    floor = float(max(MIN_DEDUP_FUZZY_THRESHOLD, min(100, int(threshold))))
+    if swap:
+        x_first, y_first = af, bl
+        x_last, y_last = al, bf
+    else:
+        x_first, y_first = af, bf
+        x_last, y_last = al, bl
+
+    first_initial = _initial_vs_full_name_component(x_first, y_first)
+    last_initial = _initial_vs_full_name_component(x_last, y_last)
+    if not (first_initial or last_initial):
+        return False
+
+    other_anchor = (
+        _strict_identity_component_score(x_last, y_last, feature_cache)
+        if first_initial
+        else _strict_identity_component_score(x_first, y_first, feature_cache)
+    )
+    if other_anchor < floor:
+        return False
+
+    middle_ok = bool(
+        am and bm
+        and _strict_middle_component_score(am, bm, feature_cache) >= float(MIDDLE_FULLWORD_MIN_SIMILARITY)
+    )
+    suffix_ok = False
+    if asu and bsu:
+        s = _suffix_similarity_score(asu, bsu)
+        suffix_ok = s is not None and s >= 100.0
+
+    dob_ok = birth_rate is not None and int(birth_compared) >= 2 and float(birth_rate) >= 80.0
+    return bool(dob_ok and (middle_ok or suffix_ok))
+
+
+def _structured_short_name_review(
+    af: str, am: str, al: str, asu: str,
+    bf: str, bm: str, bl: str, bsu: str,
+    threshold: int,
+    birth_rate: float | None,
+    birth_compared: int,
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]],
+    *,
+    swap: bool = False,
+) -> bool:
+    """Detect short C/K-style variants conservatively as Review evidence.
+
+    A short phonetic collision alone is too weak for auto-deduplication. Require
+    the opposite edge anchor plus either compatible Middle/Suffix and DOB support.
+    """
+    floor = float(max(MIN_DEDUP_FUZZY_THRESHOLD, min(100, int(threshold))))
+    if swap:
+        left_first, right_first = af, bl
+        left_last, right_last = al, bf
+    else:
+        left_first, right_first = af, bf
+        left_last, right_last = al, bl
+
+    first_score = _strict_identity_component_score(left_first, right_first, feature_cache)
+    last_score = _strict_identity_component_score(left_last, right_last, feature_cache)
+
+    short_first = _short_phonetic_equivalent(left_first, right_first)
+    short_last = _short_phonetic_equivalent(left_last, right_last)
+    if not ((short_first and last_score >= floor) or (short_last and first_score >= floor)):
+        return False
+
+    middle_ok = False
+    if am and bm:
+        middle_ok = _strict_middle_component_score(am, bm, feature_cache) >= float(MIDDLE_FULLWORD_MIN_SIMILARITY)
+    suffix_ok = False
+    if asu and bsu:
+        suffix_score = _suffix_similarity_score(asu, bsu)
+        suffix_ok = suffix_score is not None and suffix_score >= 100.0
+
+    dob_ok = birth_rate is not None and int(birth_compared) >= 2 and float(birth_rate) >= 80.0
+    return bool(dob_ok and (middle_ok or suffix_ok))
+
+
+def _structured_typo_review(
+    af: str, am: str, al: str, asu: str,
+    bf: str, bm: str, bl: str, bsu: str,
+    threshold: int,
+    birth_rate: float | None,
+    birth_compared: int,
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]],
+    *,
+    swap: bool = False,
+) -> bool:
+    """Route supported single-anchor spelling typos to Review, not Clean.
+
+    Examples include MICHAEL/MICHEAL, ALEXANDER/ALEKSANDER and
+    JONATHAN/JONATHON. The opposite First/Last anchor, DOB, and Middle/Suffix
+    support must agree. Prefix-extension traps such as JOSE/JOSEPH are excluded.
+    """
+    floor = float(max(MIN_DEDUP_FUZZY_THRESHOLD, min(100, int(threshold))))
+    if swap:
+        x_first, y_first = af, bl
+        x_last, y_last = al, bf
+    else:
+        x_first, y_first = af, bf
+        x_last, y_last = al, bl
+
+    if _short_prefix_extension_collision(x_first, y_first) or _short_prefix_extension_collision(x_last, y_last):
+        return False
+
+    first_score = _strict_identity_component_score(x_first, y_first, feature_cache)
+    last_score = _strict_identity_component_score(x_last, y_last, feature_cache)
+    near_floor = max(74.0, floor - 18.0)
+
+    one_near_one_strong = (
+        (near_floor <= first_score < floor and last_score >= floor)
+        or (near_floor <= last_score < floor and first_score >= floor)
+    )
+    if not one_near_one_strong:
+        return False
+
+    middle_ok = bool(
+        am and bm
+        and _strict_middle_component_score(am, bm, feature_cache) >= float(MIDDLE_FULLWORD_MIN_SIMILARITY)
+    )
+    suffix_ok = False
+    if asu and bsu:
+        s = _suffix_similarity_score(asu, bsu)
+        suffix_ok = s is not None and s >= 100.0
+
+    dob_ok = birth_rate is not None and int(birth_compared) >= 2 and float(birth_rate) >= 80.0
+    return bool(dob_ok and (middle_ok or suffix_ok))
+
+
+def _score_fuzzy_pair_cached(
+    row: Sequence[Any], threshold: int,
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]],
+    birth_cache: dict[str, tuple[int, int, int] | None],
+    allow_swap: bool = True,
+) -> tuple[int, int, bool, int, float, int, int, int, int]:
+    if len(row) >= 24:
+        (a_id,b_id,an,ab,af,am,al,asu,bn,bb,bf,bm,bl,bsu,evidence,hits,exact_birth,year_gap,
+         abm,abd,aby,bbm,bbd,bby)=row[:24]
+    elif len(row) >= 18:
+        (a_id,b_id,an,ab,af,am,al,asu,bn,bb,bf,bm,bl,bsu,evidence,hits,exact_birth,year_gap)=row[:18]
+        abm=abd=aby=bbm=bbd=bby=""
+    else:
+        a_id,b_id,an,ab,af,al,bn,bb,bf,bl,evidence,hits,exact_birth,year_gap=row
+        am=asu=bm=bsu=""
+        abm=abd=aby=bbm=bbd=bby=""
+    an=str(an or ""); bn=str(bn or "")
+    af=str(af or ""); am=str(am or ""); al=str(al or ""); asu=str(asu or "")
+    bf=str(bf or ""); bm=str(bm or ""); bl=str(bl or ""); bsu=str(bsu or "")
+    threshold=max(MIN_DEDUP_FUZZY_THRESHOLD,min(100,int(threshold)))
+    # DOB remains supporting evidence. It never rescues a weak name and never
+    # vetoes a complete, strong First+Middle+Last identity. When the middle name
+    # is missing, however, DOB/suffix evidence helps decide whether the result
+    # can be automatic or should remain a manual-review candidate.
+    birth_profile = _birth_component_profile_from_components(
+        (str(abm or ""), str(abd or ""), str(aby or "")),
+        (str(bbm or ""), str(bbd or ""), str(bby or "")),
+    )
+    birth_compared = int(birth_profile.get("compared", 0))
+    # Incomplete DOB does not contribute artificial evidence to Overall.
+    birth_rate = _birth_profile_rate(birth_profile) if birth_compared == 3 else None
+    if birth_rate is None and birth_compared == 0:
+        full_profile = _birth_component_profile(str(ab), str(bb))
+        if full_profile['compared'] == 3:
+            birth_rate = _birth_profile_rate(full_profile)
+            birth_compared = 3
+    structured=bool(af or am or al or asu or bf or bm or bl or bsu)
+    if structured:
+        normal=_name_component_profile(af,am,al,asu,bf,bm,bl,bsu,swap=False,feature_cache=feature_cache)
+        swapped=_name_component_profile(af,am,al,asu,bf,bm,bl,bsu,swap=True,feature_cache=feature_cache)
+
+        # Exact semantic precedence. This is intentionally repeated after the
+        # hash stage because different physical mappings (full DOB vs split DOB)
+        # or a previously asymmetric checkbox policy can otherwise make a
+        # genuinely exact pair reach the fuzzy scorer.
+        exact_dob_semantic = bool(exact_birth) or (birth_compared >= 3 and birth_rate is not None and float(birth_rate) >= 100.0)
+        if exact_dob_semantic and _profile_is_semantically_exact(
+            normal, middle_a=am, middle_b=bm, suffix_a=asu, suffix_b=bsu
+        ):
+            return int(a_id),int(b_id),True,TYPE_TRUE,100.0,int(evidence),int(hits),1,int(year_gap)
+        if allow_swap and exact_dob_semantic and _profile_is_semantically_exact(
+            swapped, middle_a=am, middle_b=bm, suffix_a=asu, suffix_b=bsu
+        ):
+            return int(a_id),int(b_id),True,TYPE_TRUE_SWAP,100.0,int(evidence),int(hits),1,int(year_gap)
+
+        # Potential Jr./Sr. or generational-suffix collision: preserve as a
+        # manual-verification CANDIDATE when the full First/Middle/Last name is
+        # exactly equal, even if suffix and DOB differ. This is not proof that
+        # the two people have the same identity.
+        suffix_conflict = bool(asu and bsu and _canonical_suffix(asu) != _canonical_suffix(bsu))
+        if suffix_conflict and af and al and af == bf and al == bl and am == bm:
+            return int(a_id),int(b_id),True,TYPE_FUZZY,100.0,int(evidence),int(hits),int(exact_birth),int(year_gap)
+
+        # Carefully bounded rescue for short spelling variants: MARIA/MARIAN
+        # with the same complete DOB and exact other identity fields is a
+        # potential duplicate even when the conservative component scorer
+        # assigns 79 to short-name prefix changes. This does not override DOB
+        # conflicts, missing DOB, differing surname, or differing middle/suffix.
+        short_exact_dob_score = 0.0
+        if (exact_dob_semantic and af and bf and af != bf and al and al == bl
+                and am == bm and asu == bsu):
+            first_raw = float(fuzz.ratio(af, bf))
+            if first_raw >= float(threshold):
+                short_exact_dob_score = round((first_raw + 100.0) / 2.0, 1)
+        if short_exact_dob_score >= float(threshold) and not _profile_accepts(normal, threshold):
+            return int(a_id),int(b_id),True,TYPE_FUZZY,short_exact_dob_score,int(evidence),int(hits),int(exact_birth),int(year_gap)
+
+        normal_ok=_profile_accepts(normal,threshold)
+        swap_ok=bool(allow_swap) and _profile_accepts(swapped,threshold)
+        if swap_ok:
+            cross_count=sum(1 for _l,s,k in swapped["components"] if k in {"first","last"} and s is not None)
+            if cross_count >= 2:
+                sf=_component_similarity_score(af,bf,feature_cache); sl=_component_similarity_score(al,bl,feature_cache)
+                cf=_component_similarity_score(af,bl,feature_cache); cl=_component_similarity_score(al,bf,feature_cache)
+                same=[x for x in (sf,sl) if x is not None]; cross=[x for x in (cf,cl) if x is not None]
+                same_avg=sum(same)/len(same) if same else 0.0; cross_avg=sum(cross)/len(cross) if cross else 0.0
+                swap_ok = cross_avg >= same_avg + 3.0 or not normal_ok
+            else:
+                swap_ok = not normal_ok
+        def structured_result(match_type: int, profile: dict[str, Any]) -> tuple[int, int, bool, int, float, int, int, int, int]:
+            rate = _profile_rate(profile)
+            # v6.27 user rule: qualifying NAME similarity (>= configured floor,
+            # minimum 80%) stays in DUPLICATE RECORDS. Missing Middle/Suffix/DOB
+            # is unknown evidence, not a reason to move a name match to Review.
+            # DOB differences are documented for manual verification and do not veto a qualifying name match.
+            return int(a_id),int(b_id),True,match_type,rate,int(evidence),int(hits),int(exact_birth),int(year_gap)
+
+        if swap_ok and (not normal_ok or float(swapped["average"]) > float(normal["average"])+2.0):
+            return structured_result(TYPE_FUZZY_SWAP, swapped)
+        if normal_ok:
+            return structured_result(TYPE_FUZZY, normal)
+        if swap_ok:
+            return structured_result(TYPE_FUZZY_SWAP, swapped)
+        # Do not throw away near-threshold identity evidence. Short-name and
+        # other conservative gates can intentionally block automatic merging;
+        # those cases remain visible to a reviewer instead of disappearing into
+        # Clean. Conflicting Middle/Suffix values still fail this review gate.
+        review_profile = normal if not allow_swap or _profile_rate(normal) >= _profile_rate(swapped) else swapped
+        review_is_swap = review_profile is swapped
+        if review_is_swap:
+            prefix_collision = _short_prefix_extension_collision(af, bl) or _short_prefix_extension_collision(al, bf)
+        else:
+            prefix_collision = _short_prefix_extension_collision(af, bf) or _short_prefix_extension_collision(al, bl)
+        if (not prefix_collision) and _profile_is_borderline_review(review_profile, threshold):
+            review_rate = _profile_rate(review_profile)
+            if review_rate >= float(threshold):
+                review_type = TYPE_FUZZY_SWAP if review_is_swap else TYPE_FUZZY
+                # Reuse structured_result for consistent name-first candidate handling.
+                return structured_result(review_type, review_profile)
+
+        # Short spelling variants such as CARL/KARL can be missed by the
+        # precision-first <=4-character component guard. Preserve them as
+        # Review when the other identity evidence is strong instead of silently
+        # labeling both records Clean.
+        normal_short_review = _structured_short_name_review(
+            af, am, al, asu, bf, bm, bl, bsu,
+            threshold, birth_rate, birth_compared, feature_cache, swap=False,
+        )
+        swap_short_review = bool(allow_swap) and _structured_short_name_review(
+            af, am, al, asu, bf, bm, bl, bsu,
+            threshold, birth_rate, birth_compared, feature_cache, swap=True,
+        )
+        if normal_short_review or swap_short_review:
+            selected_profile = swapped if (swap_short_review and _profile_rate(swapped) > _profile_rate(normal)) else normal
+            review_rate = _profile_rate(selected_profile)
+            if review_rate >= float(threshold):
+                review_type = TYPE_FUZZY_SWAP if selected_profile is swapped else TYPE_FUZZY
+                return structured_result(review_type, selected_profile)
+
+        normal_typo_review = _structured_typo_review(
+            af, am, al, asu, bf, bm, bl, bsu,
+            threshold, birth_rate, birth_compared, feature_cache, swap=False,
+        )
+        swap_typo_review = bool(allow_swap) and _structured_typo_review(
+            af, am, al, asu, bf, bm, bl, bsu,
+            threshold, birth_rate, birth_compared, feature_cache, swap=True,
+        )
+        if normal_typo_review or swap_typo_review:
+            selected_profile = swapped if (swap_typo_review and _profile_rate(swapped) > _profile_rate(normal)) else normal
+            review_rate = _profile_rate(selected_profile)
+            if review_rate >= float(threshold):
+                review_type = TYPE_FUZZY_SWAP if selected_profile is swapped else TYPE_FUZZY
+                return structured_result(review_type, selected_profile)
+
+        normal_initial_review = _structured_initial_review(
+            af, am, al, asu, bf, bm, bl, bsu,
+            threshold, birth_rate, birth_compared, feature_cache, swap=False,
+        )
+        swap_initial_review = bool(allow_swap) and _structured_initial_review(
+            af, am, al, asu, bf, bm, bl, bsu,
+            threshold, birth_rate, birth_compared, feature_cache, swap=True,
+        )
+        if normal_initial_review or swap_initial_review:
+            selected_profile = swapped if (swap_initial_review and _profile_rate(swapped) > _profile_rate(normal)) else normal
+            review_rate = _profile_rate(selected_profile)
+            if review_rate >= float(threshold):
+                review_type = TYPE_FUZZY_SWAP if selected_profile is swapped else TYPE_FUZZY
+                return structured_result(review_type, selected_profile)
+
+        return int(a_id),int(b_id),False,TYPE_CLEAN,0.0,int(evidence),int(hits),int(exact_birth),int(year_gap)
+    # Full-name-only fallback only when split components are absent.
+    exact_dob_semantic = bool(exact_birth) or (birth_compared >= 3 and birth_rate is not None and float(birth_rate) >= 100.0)
+    if an and bn and an == bn and exact_dob_semantic:
+        return int(a_id),int(b_id),True,TYPE_TRUE,100.0,int(evidence),int(hits),1,int(year_gap)
+    aphon,acompact,asorted,atokens=_fuzzy_features(an,feature_cache)
+    bphon,bcompact,bsorted,btokens=_fuzzy_features(bn,feature_cache)
+    # Full-name fallback is also containment-safe. Token-set/WRatio are search
+    # metrics and can auto-merge a shorter person's name into a longer one.
+    normal=float(max(
+        fuzz.ratio(an,bn), fuzz.QRatio(an,bn),
+        fuzz.ratio(an.replace(" ",""),bn.replace(" ","")),
+        fuzz.ratio(aphon,bphon), fuzz.QRatio(aphon,bphon),
+        fuzz.ratio(acompact,bcompact),
+    ))
+    swap=float(max(
+        fuzz.token_sort_ratio(an,bn), fuzz.token_sort_ratio(aphon,bphon),
+        fuzz.ratio("".join(sorted(an.split())),"".join(sorted(bn.split()))),
+        fuzz.ratio(asorted,bsorted), _unordered_token_alignment_score(atokens,btokens),
+    ))
+    def full_name_result(match_type: int, rate: float) -> tuple[int, int, bool, int, float, int, int, int, int]:
+        return int(a_id),int(b_id),True,match_type,round(rate,1),int(evidence),int(hits),int(exact_birth),int(year_gap)
+
+    a_core, a_suffix = _full_name_core_tokens(an)
+    b_core, b_suffix = _full_name_core_tokens(bn)
+    if a_suffix and b_suffix and a_suffix != b_suffix and a_core and a_core == b_core:
+        return full_name_result(TYPE_FUZZY, 100.0)
+
+    support_decision, support_rate = _full_name_support_decision(
+        an, bn, threshold, birth_rate, birth_compared, feature_cache
+    )
+
+    # Explicit suffix conflict or short-prefix collision must never be promoted
+    # merely because the whole concatenated string has a high fuzzy ratio.
+    if support_decision == "reject":
+        return int(a_id),int(b_id),False,TYPE_CLEAN,0.0,int(evidence),int(hits),int(exact_birth),int(year_gap)
+    if support_decision == "review":
+        # Short-prefix containment is intentionally not auto-deduplicated even
+        # at an 80% run. It is a known distinct-name collision pattern.
+        aligned_prefix_collision = False
+        if len(atokens) == len(btokens):
+            aligned_prefix_collision = any(
+                _short_prefix_extension_collision(x, y)
+                for x, y in zip(atokens, btokens)
+            )
+        if aligned_prefix_collision:
+            return int(a_id),int(b_id),False,TYPE_CLEAN,0.0,int(evidence),int(hits),int(exact_birth),int(year_gap)
+        review_rate = max(float(support_rate), max(normal, swap))
+        if review_rate >= float(threshold):
+            match_type = TYPE_FUZZY_SWAP if (allow_swap and swap > normal + 2.0) else TYPE_FUZZY
+            return full_name_result(match_type, review_rate)
+        return int(a_id),int(b_id),False,TYPE_CLEAN,0.0,int(evidence),int(hits),int(exact_birth),int(year_gap)
+    if support_decision == "auto":
+        return full_name_result(TYPE_FUZZY, max(float(normal), float(support_rate)))
+
+    if allow_swap and _looks_swap_tokens(atokens,btokens) and swap >= float(threshold):
+        return full_name_result(TYPE_FUZZY_SWAP, swap)
+    if normal >= float(threshold):
+        return full_name_result(TYPE_FUZZY, normal)
+    return int(a_id),int(b_id),False,TYPE_CLEAN,0.0,int(evidence),int(hits),int(exact_birth),int(year_gap)
+
+
+def score_fuzzy_pair(row: Sequence[Any], threshold: int) -> tuple[int, int, bool, int, float, int, int, int, int]:
+    return _score_fuzzy_pair_cached(row, threshold, {}, {}, True)
+
+
+def _hot_uniform_supported_keys(
+    conn: sqlite3.Connection,
+    col: str,
+    cross: bool,
+    use_clean_filter: bool,
+) -> list[int]:
+    """Find high-cost blocks that are one identical supported name profile.
+
+    These blocks are already represented losslessly by sparse profile edges, so
+    executing a Cartesian join adds no information.  The threshold only decides
+    when to switch algorithms; it never removes a possible match.
+    """
+    prof_a = "(a.first_name || char(31) || a.middle_name || char(31) || a.last_name || char(31) || a.suffix_name)"
+    if not cross:
+        clean = "JOIN fuzzy_clean_a ca ON ca.row_id=a.row_id" if use_clean_filter else ""
+        sql = f"""
+            SELECT a.{col} AS k
+            FROM rows_a a {clean}
+            WHERE a.{col}<>0 AND a.first_name<>'' AND a.last_name<>''
+              AND (a.middle_name<>'' OR a.suffix_name<>'')
+              AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0
+            GROUP BY a.{col}
+            HAVING (COUNT(*) * (COUNT(*) - 1)) / 2 > ?
+               AND COUNT(DISTINCT {prof_a})=1
+        """
+    else:
+        clean = "JOIN fuzzy_clean_a ca ON ca.row_id=a.row_id" if use_clean_filter else ""
+        prof_b = "(b.first_name || char(31) || b.middle_name || char(31) || b.last_name || char(31) || b.suffix_name)"
+        sql = f"""
+            WITH ac AS (
+                SELECT a.{col} AS k,COUNT(*) AS n,MIN({prof_a}) AS p
+                FROM rows_a a {clean}
+                WHERE a.{col}<>0 AND a.first_name<>'' AND a.last_name<>''
+                  AND (a.middle_name<>'' OR a.suffix_name<>'')
+                  AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0
+                GROUP BY a.{col}
+                HAVING COUNT(DISTINCT {prof_a})=1
+            ), bc AS (
+                SELECT b.{col} AS k,COUNT(*) AS n,MIN({prof_b}) AS p
+                FROM rows_b b
+                WHERE b.{col}<>0 AND b.first_name<>'' AND b.last_name<>''
+                  AND (b.middle_name<>'' OR b.suffix_name<>'')
+                  AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+                GROUP BY b.{col}
+                HAVING COUNT(DISTINCT {prof_b})=1
+            )
+            SELECT ac.k FROM ac JOIN bc ON ac.k=bc.k AND ac.p=bc.p
+            WHERE ac.n * bc.n > ?
+        """
+    return [int(r[0]) for r in conn.execute(sql,(int(HOT_BLOCK_SWITCH_PAIRS),))]
+
+
+def _hot_complete_middle_keys(
+    conn: sqlite3.Connection,
+    col: str,
+    cross: bool,
+    use_clean_filter: bool,
+) -> list[int]:
+    """Return block keys whose complete-middle Cartesian cost is high.
+
+    HOT_BLOCK_SWITCH_PAIRS only chooses the algorithm. It is not a matching cap:
+    every hot key is processed by the profile-level matcher below instead of by
+    a raw SQL Cartesian join.
+    """
+    if cross:
+        a_join = "JOIN fuzzy_clean_a ca ON ca.row_id=a.row_id" if use_clean_filter else ""
+        sql = f"""
+            WITH ac AS (
+                SELECT a.{col} AS k, COUNT(*) AS n
+                FROM rows_a a {a_join}
+                WHERE a.{col}<>0 AND a.middle_name<>''
+                  AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0
+                GROUP BY a.{col}
+            ), bc AS (
+                SELECT b.{col} AS k, COUNT(*) AS n
+                FROM rows_b b
+                WHERE b.{col}<>0 AND b.middle_name<>''
+                  AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+                GROUP BY b.{col}
+            )
+            SELECT ac.k
+            FROM ac JOIN bc ON ac.k=bc.k
+            WHERE ac.n * bc.n > ?
+        """
+    else:
+        a_join = "JOIN fuzzy_clean_a ca ON ca.row_id=a.row_id" if use_clean_filter else ""
+        sql = f"""
+            SELECT a.{col} AS k
+            FROM rows_a a {a_join}
+            WHERE a.{col}<>0 AND a.middle_name<>''
+              AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0
+            GROUP BY a.{col}
+            HAVING (COUNT(*) * (COUNT(*) - 1)) / 2 > ?
+        """
+    return [int(r[0]) for r in conn.execute(sql, (int(HOT_BLOCK_SWITCH_PAIRS),))]
+
+
+def _fetch_hot_block_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    col: str,
+    key: int,
+    *,
+    use_clean_filter: bool = False,
+    side_a: bool = False,
+) -> list[tuple[Any, ...]]:
+    clean_join = "JOIN fuzzy_clean_a ca ON ca.row_id=r.row_id" if use_clean_filter and side_a else ""
+    return list(conn.execute(f"""
+        SELECT r.row_id,r.name,r.birth,r.first_name,r.middle_name,r.last_name,r.suffix_name,
+               r.birth_month_component,r.birth_day_component,r.birth_year_component,r.byear
+        FROM {table} r
+        {clean_join}
+        WHERE r.{col}=? AND r.middle_name<>''
+          AND (r.finding & {F_DEDUP_BLOCKING_FINDING})=0
+        ORDER BY r.row_id
+    """, (int(key),)))
+
+
+def _hot_profile_key(rec: tuple[Any, ...]) -> tuple[str, str, str, str, str]:
+    # name plus split components keeps Full-Name-only and structured records apart.
+    return tuple(str(x or "") for x in (rec[1], rec[3], rec[4], rec[5], rec[6]))
+
+
+def _hot_profile_groups(rows: list[tuple[Any, ...]]) -> tuple[list[tuple[Any, ...]], list[list[tuple[Any, ...]]]]:
+    grouped: dict[tuple[str, str, str, str, str], list[tuple[Any, ...]]] = {}
+    for rec in rows:
+        grouped.setdefault(_hot_profile_key(rec), []).append(rec)
+    keys = list(grouped)
+    return keys, [grouped[k] for k in keys]
+
+
+def _delete_variants_exact(value: str, deletions: int) -> set[str]:
+    value=str(value or "")
+    d=max(0,int(deletions))
+    current={value}
+    for _ in range(d):
+        nxt:set[str]=set()
+        for item in current:
+            for pos in range(len(item)):
+                nxt.add(item[:pos]+item[pos+1:])
+        current=nxt
+        if not current:
+            break
+    return current
+
+
+def _identity_delete_representations(value: str) -> tuple[str, ...]:
+    """Representations actually capable of winning the strict edge scorer."""
+    value=str(value or "").strip()
+    raw=re.sub(r"\s+","",value)
+    phon=_fuzzy_phon(value)
+    phon_compact=re.sub(r"\s+","",phon)
+    reps=[raw,phon_compact]
+    if " " in value:
+        reps.append("".join(sorted(value.split())))
+    if " " in phon:
+        reps.append("".join(sorted(phon.split())))
+    return tuple(dict.fromkeys(x for x in reps if x))
+
+
+def _max_target_deletions(target_len: int, threshold: int) -> int:
+    """Maximum deletions the target can need in any threshold-qualified pair."""
+    L=max(1,int(target_len)); t=max(0.01,min(1.0,float(threshold)/100.0)); q=1.0-t
+    qmin=max(1,int(np.ceil((t*L)/(2.0-t))))
+    qmax=max(qmin,int(np.floor(((2.0-t)*L)/t)))
+    best=0
+    for qlen in range(qmin,qmax+1):
+        dmax=int(np.floor(q*(qlen+L)+1e-9)); delta=L-qlen
+        # d_target = d_query + delta and 2*d_query+delta <= dmax
+        dq_max=int(np.floor((dmax-delta)/2.0))
+        if dq_max < 0:
+            continue
+        dt=dq_max+delta
+        if dt>=0:
+            best=max(best,int(dt))
+    return best
+
+
+class _DeletionSignatureIndex:
+    """Radius-complete Indel candidate index with no top-N neighbor cap.
+
+    Keys use Python's 64-bit hash to reduce memory. A hash collision can only add
+    a false candidate; it cannot create a false duplicate because the full name
+    scorer verifies the original strings afterward.
+    """
+    def __init__(self, values: list[str], threshold: int) -> None:
+        self.threshold=max(1,min(100,int(threshold)))
+        self.index: dict[int,list[int]]={}
+        self.lengths:set[int]=set()
+        for idx,value in enumerate(values):
+            seen_keys:set[int]=set()
+            for rep in _identity_delete_representations(value):
+                L=len(rep); self.lengths.add(L)
+                max_del=_max_target_deletions(L,self.threshold)
+                for d in range(max_del+1):
+                    for sig in _delete_variants_exact(rep,d):
+                        key=hash((L,d,sig))
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
+                        self.index.setdefault(key,[]).append(int(idx))
+        self.lengths=sorted(self.lengths)
+
+    def query(self, value: str) -> set[int]:
+        t=float(self.threshold)/100.0; q=1.0-t; out:set[int]=set()
+        for rep in _identity_delete_representations(value):
+            la=len(rep); cache:dict[int,set[str]]={}
+            for lb in self.lengths:
+                dmax=int(np.floor(q*(la+lb)+1e-9)); delta=lb-la
+                if abs(delta)>dmax:
+                    continue
+                for da in range(dmax+1):
+                    db=da+delta
+                    if db<0 or da+db>dmax:
+                        continue
+                    variants=cache.get(da)
+                    if variants is None:
+                        variants=_delete_variants_exact(rep,da); cache[da]=variants
+                    for sig in variants:
+                        out.update(self.index.get(hash((lb,db,sig)),()))
+        return out
+
+
+def _hot_dense_identity_candidate_pairs(
+    left_keys: list[tuple[Any,...]],
+    right_keys: list[tuple[Any,...]],
+    *, threshold: int, cross: bool, allow_swap: bool,
+) -> Iterator[tuple[int,int]]:
+    """Full-recall high-threshold First/Last discovery for dense hot blocks."""
+    rf=[str(k[1] or "") for k in right_keys]; rl=[str(k[3] or "") for k in right_keys]
+    first_index=_DeletionSignatureIndex(rf,threshold)
+    last_index=_DeletionSignatureIndex(rl,threshold)
+    for li,key in enumerate(left_keys):
+        lf=str(key[1] or ""); ll=str(key[3] or "")
+        candidates=first_index.query(lf) & last_index.query(ll)
+        if allow_swap:
+            candidates |= (last_index.query(lf) & first_index.query(ll))
+        for rj in sorted(candidates):
+            if not cross and li>=rj:
+                continue
+            yield li,int(rj)
+
+
+def _hot_middle_candidate_pairs(
+    left_middles: list[str],
+    right_middles: list[str],
+    *,
+    cross: bool,
+) -> Iterator[tuple[int, int]]:
+    """Yield profile-index pairs whose middle names can clear the 90% hard gate.
+
+    Uses chunked RapidFuzz C matrices and emits all qualifying profile pairs;
+    there is no top-N candidate truncation.
+    """
+    if not left_middles or not right_middles:
+        return
+    lorig = [str(x or "") for x in left_middles]
+    rorig = [str(x or "") for x in right_middles]
+    lphon = [_fuzzy_phon(x) for x in lorig]
+    rphon = [_fuzzy_phon(x) for x in rorig]
+    yielded: set[tuple[int, int]] = set()
+    for start in range(0, len(lorig), HOT_BLOCK_CDIST_CHUNK):
+        stop = min(len(lorig), start + HOT_BLOCK_CDIST_CHUNK)
+        lo = lorig[start:stop]; lp = lphon[start:stop]
+        masks = []
+        for left_vals, right_vals, scorer in (
+            (lo, rorig, fuzz.ratio),
+            (lo, rorig, fuzz.token_sort_ratio),
+            (lp, rphon, fuzz.ratio),
+            (lp, rphon, fuzz.token_sort_ratio),
+        ):
+            mat = process.cdist(
+                left_vals, right_vals,
+                scorer=scorer,
+                score_cutoff=float(MIDDLE_FULLWORD_MIN_SIMILARITY),
+                dtype=np.uint8,
+                workers=1,
+            )
+            masks.append(mat >= int(MIDDLE_FULLWORD_MIN_SIMILARITY))
+        mask = masks[0] | masks[1] | masks[2] | masks[3]
+        rr, cc = np.nonzero(mask)
+        for ri, cj in zip(rr.tolist(), cc.tolist()):
+            li = start + int(ri); rj = int(cj)
+            if not cross and li >= rj:
+                continue
+            pair = (li, rj)
+            if pair not in yielded:
+                yielded.add(pair)
+                yield pair
+
+    # Initial/full-middle compatibility is not captured reliably by ratio matrices.
+    # Avoid an O(P^2) Python nested loop by indexing full signatures by the
+    # one/two-character prefixes that a legitimate middle initial can use.
+    linit = [_middle_initial_signature(x) for x in lorig]
+    rinit = [_middle_initial_signature(x) for x in rorig]
+
+    r_full_by_prefix: dict[str, list[int]] = {}
+    for rj, (rsig, ris) in enumerate(rinit):
+        if not rsig or ris:
+            continue
+        for plen in range(1, min(2, len(rsig)) + 1):
+            r_full_by_prefix.setdefault(rsig[:plen], []).append(rj)
+    for li, (lsig, lis) in enumerate(linit):
+        if not lsig or not lis:
+            continue
+        for rj in r_full_by_prefix.get(lsig, []):
+            if not cross and li >= rj:
+                continue
+            pair = (li, rj)
+            if pair not in yielded:
+                yielded.add(pair)
+                yield pair
+
+    l_full_by_prefix: dict[str, list[int]] = {}
+    for li, (lsig, lis) in enumerate(linit):
+        if not lsig or lis:
+            continue
+        for plen in range(1, min(2, len(lsig)) + 1):
+            l_full_by_prefix.setdefault(lsig[:plen], []).append(li)
+    for rj, (rsig, ris) in enumerate(rinit):
+        if not rsig or not ris:
+            continue
+        for li in l_full_by_prefix.get(rsig, []):
+            if not cross and li >= rj:
+                continue
+            pair = (li, rj)
+            if pair not in yielded:
+                yielded.add(pair)
+                yield pair
+
+
+def _hot_pair_score(
+    a_rec: tuple[Any, ...],
+    b_rec: tuple[Any, ...],
+    threshold: int,
+    allow_swap: bool,
+) -> tuple[int, int, bool, int, float, int, int, int, int]:
+    a_id, an, ab, af, am, al, asu, abm, abd, aby, ay = a_rec
+    b_id, bn, bb, bf, bm, bl, bsu, bbm, bbd, bby, by = b_rec
+    exact_birth = int(bool(ab) and str(ab) == str(bb))
+    year_gap = abs(int(ay) - int(by)) if int(ay or 0) > 0 and int(by or 0) > 0 else 9999
+    row = (
+        a_id,b_id,an,ab,af,am,al,asu,bn,bb,bf,bm,bl,bsu,
+        1,1,exact_birth,year_gap,abm,abd,aby,bbm,bbd,bby,
+    )
+    return _score_fuzzy_pair_cached(row, threshold, {}, {}, allow_swap)
+
+
+def _choose_hot_b_row(a_rec: tuple[Any, ...], b_rows: list[tuple[Any, ...]]) -> tuple[Any, ...]:
+    ab = str(a_rec[2] or ""); ay = int(a_rec[10] or 0)
+    def key(rec: tuple[Any, ...]) -> tuple[int, int, int]:
+        bb = str(rec[2] or ""); by = int(rec[10] or 0)
+        exact = int(bool(ab) and ab == bb)
+        gap = abs(ay - by) if ay > 0 and by > 0 else 9999
+        return (-exact, gap, int(rec[0]))
+    return min(b_rows, key=key)
+
+
+
+class _HotWithinReducer:
+    """Compact accepted hot-block relationships to a spanning forest.
+
+    This is not a candidate cap. Every proposed hot profile relationship is
+    still verified by the authoritative name scorer. Once two rows are already
+    connected by previously accepted hot evidence, storing/scoring another edge
+    between those same hot components cannot change duplicate connectivity.
+    """
+    def __init__(self, total_rows: int) -> None:
+        self.parent=np.arange(int(total_rows),dtype=np.int64)
+        self.rank=np.zeros(int(total_rows),dtype=np.uint8)
+
+    def find(self, x: int) -> int:
+        x=int(x)
+        while int(self.parent[x]) != x:
+            self.parent[x]=self.parent[int(self.parent[x])]
+            x=int(self.parent[x])
+        return x
+
+    def connected(self, a: int, b: int) -> bool:
+        return self.find(int(a)) == self.find(int(b))
+
+    def union(self, a: int, b: int) -> bool:
+        ra=self.find(int(a)); rb=self.find(int(b))
+        if ra==rb:
+            return False
+        if self.rank[ra] < self.rank[rb]:
+            self.parent[ra]=rb
+        elif self.rank[ra] > self.rank[rb]:
+            self.parent[rb]=ra
+        else:
+            self.parent[rb]=ra; self.rank[ra]+=1
+        return True
+
+
+def _hot_profile_name_decision(
+    a_key: tuple[Any,...],
+    b_key: tuple[Any,...],
+    threshold: int,
+    allow_swap: bool,
+    feature_cache: dict[str, tuple[str,str,str,tuple[str,...]]] | None = None,
+) -> tuple[bool,int,float,bool]:
+    """Fast authoritative name-only decision for complete-middle hot profiles.
+
+    Complete First+Middle+Last identity evidence is sufficient under the v6.19
+    rules; DOB only supports/warns and cannot overturn a complete strong name.
+    Returns (accepted, type, rate, borderline_review).
+    """
+    cache=feature_cache if feature_cache is not None else {}
+    _an,af,am,al,asu=(str(x or '') for x in a_key)
+    _bn,bf,bm,bl,bsu=(str(x or '') for x in b_key)
+    # Fall back to the row scorer outside the normal structured case.
+    if not (af and am and al and bf and bm and bl):
+        return False,TYPE_CLEAN,0.0,False
+    normal=_name_component_profile(af,am,al,asu,bf,bm,bl,bsu,swap=False,feature_cache=cache)
+    best_prof=normal; best_type=TYPE_FUZZY
+    accepted=_profile_accepts(normal,int(threshold))
+    borderline=_profile_is_borderline_review(normal,int(threshold))
+    if allow_swap:
+        swapped=_name_component_profile(af,am,al,asu,bf,bm,bl,bsu,swap=True,feature_cache=cache)
+        swap_ok=_profile_accepts(swapped,int(threshold))
+        swap_border=_profile_is_borderline_review(swapped,int(threshold))
+        if swap_ok and (not accepted or _profile_rate(swapped) > _profile_rate(normal)):
+            accepted=True; best_prof=swapped; best_type=TYPE_FUZZY_SWAP
+        elif not accepted and swap_border and _profile_rate(swapped) > _profile_rate(best_prof):
+            best_prof=swapped; best_type=TYPE_FUZZY_SWAP
+        borderline=bool(borderline or swap_border)
+    return bool(accepted),int(best_type),float(_profile_rate(best_prof)),bool(borderline and not accepted)
+
+
+def _process_hot_complete_middle_block(
+    conn: sqlite3.Connection,
+    col: str,
+    key: int,
+    cross: bool,
+    options: ScaleOptions,
+    use_clean_filter: bool,
+    processed_sets: set[tuple[Any, ...]] | None = None,
+    within_reducer: _HotWithinReducer | None = None,
+) -> int:
+    """Process one hot block at unique-name-profile level and insert sparse edges.
+
+    Within-file mode inserts only a spanning set of accepted edges, which is
+    sufficient to preserve duplicate connected components. Cross mode inserts
+    the best and near-tied B profile candidates for each A row, sufficient for
+    best-match and ambiguity decisions. No profile candidate is discarded by a
+    fixed top-N row cap.
+    """
+    a_rows = _fetch_hot_block_rows(conn, "rows_a", col, key, use_clean_filter=use_clean_filter, side_a=True)
+    if not a_rows:
+        return 0
+    b_rows = _fetch_hot_block_rows(conn, "rows_b" if cross else "rows_a", col, key,
+                                   use_clean_filter=(use_clean_filter and not cross), side_a=(not cross))
+    if not b_rows:
+        return 0
+    if processed_sets is not None:
+        a_ids = tuple(int(r[0]) for r in a_rows)
+        b_ids = tuple(int(r[0]) for r in b_rows) if cross else a_ids
+        fingerprint = (
+            bool(cross), len(a_ids), hash(a_ids), a_ids[0], a_ids[-1],
+            len(b_ids), hash(b_ids), b_ids[0], b_ids[-1],
+        )
+        if fingerprint in processed_sets:
+            return 0
+        processed_sets.add(fingerprint)
+    a_keys, a_groups = _hot_profile_groups(a_rows)
+    if cross:
+        b_keys, b_groups = _hot_profile_groups(b_rows)
+    else:
+        b_keys, b_groups = a_keys, a_groups
+
+    a_mids = [k[2] for k in a_keys]
+    b_mids = [k[2] for k in b_keys]
+    inserted: list[tuple[int, int]] = []
+
+    # If one/few Middle values dominate a huge hot block, Middle-first cdist
+    # is the wrong search axis. At high production thresholds switch to a
+    # length-aware deletion-signature index on First+Last. It enumerates every
+    # threshold-possible neighbor without top-N truncation. At deliberately
+    # broad thresholds (<88), dense common-name blocks are safer as Review than
+    # as automatic pair storms.
+    from collections import Counter
+    ac = Counter(a_mids); bc = Counter(b_mids)
+    if cross:
+        dense_middle_pairs = sum(int(n) * int(bc.get(mid, 0)) for mid, n in ac.items())
+    else:
+        dense_middle_pairs = sum((int(n) * (int(n) - 1)) // 2 for n in ac.values())
+    dense_identity_mode = dense_middle_pairs > int(HOT_DENSE_MIDDLE_PAIR_SWITCH) and int(options.fuzzy_threshold) >= 88
+    dense_review_mode = dense_middle_pairs > int(HOT_DENSE_MIDDLE_PAIR_SWITCH) and int(options.fuzzy_threshold) < 88
+    # b4 is an ordered First+Last phonetic-edge block. A genuine First/Last
+    # swap cannot share b4 in reversed order, so probing the swapped deletion
+    # intersection here only doubles hot-block work without discovering a new
+    # pair. Unordered/whole-name lanes continue to support swap discovery.
+    hot_allow_swap = bool(options.enable_swap) and str(col) != "b4"
+    if dense_review_mode:
+        if cross:
+            b_ref: dict[str, int] = {}
+            for grp_key, grp in zip(b_keys, b_groups):
+                mid=str(grp_key[2] or "")
+                if mid not in b_ref and grp:
+                    b_ref[mid]=int(grp[0][0])
+            conn.executemany(
+                "INSERT OR IGNORE INTO fuzzy_pre_review(a,b) VALUES (?,?)",
+                ((int(rec[0]), int(b_ref.get(str(keyv[2] or ""), -1)))
+                 for keyv, grp in zip(a_keys,a_groups) for rec in grp
+                 if str(keyv[2] or "") in b_ref),
+            )
+        else:
+            conn.executemany(
+                "INSERT OR IGNORE INTO fuzzy_pre_review(a,b) VALUES (?,?)",
+                ((int(rec[0]), -1) for grp in a_groups for rec in grp),
+            )
+        return 0
+
+    if not cross:
+        # Exact supported same-profile chains are already inserted globally by
+        # _insert_exact_supported_profile_edges(). For different profiles, score
+        # the *name profile* here and retain only a spanning forest of accepted
+        # hot relationships. This avoids materializing millions of redundant
+        # fuzzy graph edges while preserving every connected duplicate family.
+        pair_iter = (
+            _hot_dense_identity_candidate_pairs(a_keys,b_keys,threshold=int(options.fuzzy_threshold),cross=False,allow_swap=hot_allow_swap)
+            if dense_identity_mode else _hot_middle_candidate_pairs(a_mids,b_mids,cross=False)
+        )
+        feature_cache: dict[str, tuple[str,str,str,tuple[str,...]]] = {}
+        review_ids: set[int] = set()
+        for pi, pj in pair_iter:
+            if pi == pj:
+                continue
+            a_id=int(a_groups[pi][0][0]); b_id=int(a_groups[pj][0][0])
+            if within_reducer is not None and within_reducer.connected(a_id,b_id):
+                continue
+            accepted, _t, _rate, borderline = _hot_profile_name_decision(
+                a_keys[pi], b_keys[pj], int(options.fuzzy_threshold), hot_allow_swap, feature_cache
+            )
+            if accepted:
+                if within_reducer is None or within_reducer.union(a_id,b_id):
+                    inserted.append((min(a_id,b_id),max(a_id,b_id)))
+            elif borderline:
+                # Every row in these two exact profiles shares the same name
+                # ambiguity. Mark the profiles for Review without creating the
+                # full cross-product of review pairs.
+                review_ids.update(int(r[0]) for r in a_groups[pi])
+                review_ids.update(int(r[0]) for r in a_groups[pj])
+        if review_ids:
+            conn.executemany(
+                "INSERT OR IGNORE INTO fuzzy_pre_review(a,b) VALUES (?,-1)",
+                ((int(x),) for x in review_ids),
+            )
+    else:
+        by_a_profile: dict[int, list[tuple[float, int]]] = {}
+        pair_iter = (
+            _hot_dense_identity_candidate_pairs(a_keys,b_keys,threshold=int(options.fuzzy_threshold),cross=True,allow_swap=hot_allow_swap)
+            if dense_identity_mode else _hot_middle_candidate_pairs(a_mids,b_mids,cross=True)
+        )
+        for pi, pj in pair_iter:
+            r = _hot_pair_score(a_groups[pi][0], b_groups[pj][0], int(options.fuzzy_threshold), hot_allow_swap)
+            if not r[2]:
+                continue
+            by_a_profile.setdefault(pi, []).append((float(r[4]), pj))
+        for pi, choices in by_a_profile.items():
+            if not choices:
+                continue
+            top = max(x[0] for x in choices)
+            # Keep every B profile close enough to affect the best/ambiguity
+            # decision; lower-scoring profiles cannot become the selected match.
+            selected = [pj for score, pj in choices if score >= top - float(AMBIGUOUS_MATCH_MARGIN)]
+            for arec in a_groups[pi]:
+                for pj in selected:
+                    brec = _choose_hot_b_row(arec, b_groups[pj])
+                    inserted.append((int(arec[0]), int(brec[0])))
+
+    if inserted:
+        conn.executemany("INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b) VALUES (?,?)", inserted)
+    return len(inserted)
+
+def _insert_exact_supported_profile_edges(
+    conn: sqlite3.Connection,
+    cross: bool,
+    use_clean_filter: bool,
+) -> int:
+    """Compress repeated exact name profiles into sparse edges.
+
+    If the structured First/Middle/Last/Suffix profile is identical and either
+    Middle or Suffix is present, the final fuzzy decision does not need DOB to
+    establish adequate name support.  Materializing every pair in a repeated
+    profile is therefore redundant.  Within-file mode inserts a spanning chain
+    (N-1 edges); Cross mode maps each A profile to one deterministic B profile
+    representative.  This is lossless for family connectivity and uses no cap.
+    """
+    before = int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidate_pairs").fetchone()[0])
+    clean_a = "AND EXISTS (SELECT 1 FROM fuzzy_clean_a ca WHERE ca.row_id=r.row_id)" if use_clean_filter else ""
+    eligible = f"""
+        r.first_name<>'' AND r.last_name<>''
+        AND (r.middle_name<>'' OR r.suffix_name<>'')
+        AND (r.finding & {F_DEDUP_BLOCKING_FINDING})=0
+        {clean_a}
+    """
+    if not cross:
+        conn.execute(f"""
+            WITH ordered AS (
+                SELECT r.row_id,
+                       LAG(r.row_id) OVER (
+                           PARTITION BY r.first_name,r.middle_name,r.last_name,r.suffix_name
+                           ORDER BY r.row_id
+                       ) AS prev_id
+                FROM rows_a r
+                WHERE {eligible}
+            )
+            INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+            SELECT prev_id,row_id FROM ordered WHERE prev_id IS NOT NULL
+        """)
+    else:
+        conn.execute("DROP TABLE IF EXISTS fuzzy_profile_b")
+        conn.execute(f"""
+            CREATE TEMP TABLE fuzzy_profile_b AS
+            SELECT b.first_name,b.middle_name,b.last_name,b.suffix_name,MIN(b.row_id) AS row_id
+            FROM rows_b b
+            WHERE b.first_name<>'' AND b.last_name<>''
+              AND (b.middle_name<>'' OR b.suffix_name<>'')
+              AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+            GROUP BY b.first_name,b.middle_name,b.last_name,b.suffix_name
+        """)
+        conn.execute("CREATE INDEX idx_fuzzy_profile_b ON fuzzy_profile_b(first_name,middle_name,last_name,suffix_name)")
+        clean_cross = "AND EXISTS (SELECT 1 FROM fuzzy_clean_a ca WHERE ca.row_id=a.row_id)" if use_clean_filter else ""
+        conn.execute(f"""
+            INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+            SELECT a.row_id,p.row_id
+            FROM rows_a a
+            JOIN fuzzy_profile_b p
+              ON a.first_name=p.first_name
+             AND a.middle_name=p.middle_name
+             AND a.last_name=p.last_name
+             AND a.suffix_name=p.suffix_name
+            WHERE a.first_name<>'' AND a.last_name<>''
+              AND (a.middle_name<>'' OR a.suffix_name<>'')
+              AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0
+              {clean_cross}
+        """)
+        conn.execute("DROP TABLE IF EXISTS fuzzy_profile_b")
+    after = int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidate_pairs").fetchone()[0])
+    return max(0, after - before)
+
+
+def _rescue_hot_missing_middle(
+    conn: sqlite3.Connection,
+    col: str,
+    hot_table: str,
+    cross: bool,
+    use_clean_filter: bool,
+) -> int:
+    """Sparse rescue for missing-Middle rows inside a hot block.
+
+    Automatic fuzzy classification with a missing Middle requires either a
+    compatible Suffix or >=2 useful DOB components.  In a huge block, blindly
+    pairing that row with every complete-Middle record is both expensive and
+    ambiguous.  This helper uses exact First+Last plus exact strong supporting
+    evidence to create one deterministic candidate only when the complete-Middle
+    partner profile is unambiguous. Remaining rows are preserved as Review.
+    """
+    before=int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidate_pairs").fetchone()[0])
+    clean_a = "AND EXISTS (SELECT 1 FROM fuzzy_clean_a ca WHERE ca.row_id=a.row_id)" if use_clean_filter else ""
+    partner = "rows_b" if cross else "rows_a"
+
+    conn.execute("DROP TABLE IF EXISTS hot_mid_partner_dob")
+    conn.execute(f"""
+        CREATE TEMP TABLE hot_mid_partner_dob AS
+        SELECT b.first_name,b.last_name,b.birth_month_component,b.birth_day_component,b.birth_year_component,
+               MIN(b.row_id) AS row_id,COUNT(DISTINCT b.middle_name) AS middle_profiles
+        FROM {partner} b
+        JOIN {hot_table} hk ON hk.k=b.{col}
+        WHERE b.middle_name<>'' AND b.first_name<>'' AND b.last_name<>''
+          AND b.birth_month_component<>'' AND b.birth_day_component<>'' AND b.birth_year_component<>''
+          AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+        GROUP BY b.first_name,b.last_name,b.birth_month_component,b.birth_day_component,b.birth_year_component
+    """)
+    conn.execute("CREATE INDEX idx_hot_mid_partner_dob ON hot_mid_partner_dob(first_name,last_name,birth_month_component,birth_day_component,birth_year_component)")
+
+    if not cross:
+        conn.execute(f"""
+            INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+            SELECT MIN(a.row_id,p.row_id),MAX(a.row_id,p.row_id)
+            FROM rows_a a
+            JOIN {hot_table} hk ON hk.k=a.{col}
+            JOIN hot_mid_partner_dob p
+              ON p.first_name=a.first_name AND p.last_name=a.last_name
+             AND p.birth_month_component=a.birth_month_component
+             AND p.birth_day_component=a.birth_day_component
+             AND p.birth_year_component=a.birth_year_component
+            WHERE a.middle_name='' AND p.middle_profiles=1 AND p.row_id<>a.row_id
+              AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0 {clean_a}
+        """)
+    else:
+        conn.execute(f"""
+            INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+            SELECT a.row_id,p.row_id
+            FROM rows_a a
+            JOIN {hot_table} hk ON hk.k=a.{col}
+            JOIN hot_mid_partner_dob p
+              ON p.first_name=a.first_name AND p.last_name=a.last_name
+             AND p.birth_month_component=a.birth_month_component
+             AND p.birth_day_component=a.birth_day_component
+             AND p.birth_year_component=a.birth_year_component
+            WHERE a.middle_name='' AND p.middle_profiles=1
+              AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0 {clean_a}
+        """)
+
+    conn.execute("DROP TABLE IF EXISTS hot_mid_partner_suffix")
+    conn.execute(f"""
+        CREATE TEMP TABLE hot_mid_partner_suffix AS
+        SELECT b.first_name,b.last_name,b.suffix_name,MIN(b.row_id) AS row_id,
+               COUNT(DISTINCT b.middle_name) AS middle_profiles
+        FROM {partner} b
+        JOIN {hot_table} hk ON hk.k=b.{col}
+        WHERE b.middle_name<>'' AND b.first_name<>'' AND b.last_name<>'' AND b.suffix_name<>''
+          AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+        GROUP BY b.first_name,b.last_name,b.suffix_name
+    """)
+    conn.execute("CREATE INDEX idx_hot_mid_partner_suffix ON hot_mid_partner_suffix(first_name,last_name,suffix_name)")
+    if not cross:
+        conn.execute(f"""
+            INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+            SELECT MIN(a.row_id,p.row_id),MAX(a.row_id,p.row_id)
+            FROM rows_a a
+            JOIN {hot_table} hk ON hk.k=a.{col}
+            JOIN hot_mid_partner_suffix p
+              ON p.first_name=a.first_name AND p.last_name=a.last_name AND p.suffix_name=a.suffix_name
+            WHERE a.middle_name='' AND a.suffix_name<>'' AND p.middle_profiles=1 AND p.row_id<>a.row_id
+              AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0 {clean_a}
+        """)
+    else:
+        conn.execute(f"""
+            INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+            SELECT a.row_id,p.row_id
+            FROM rows_a a
+            JOIN {hot_table} hk ON hk.k=a.{col}
+            JOIN hot_mid_partner_suffix p
+              ON p.first_name=a.first_name AND p.last_name=a.last_name AND p.suffix_name=a.suffix_name
+            WHERE a.middle_name='' AND a.suffix_name<>'' AND p.middle_profiles=1
+              AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0 {clean_a}
+        """)
+
+    # Preserve every unresolved A-side missing-Middle row from the hot block as
+    # Review. Accepted candidates from this or other lanes override this marker.
+    conn.execute(f"""
+        INSERT OR IGNORE INTO fuzzy_pre_review(a,b)
+        SELECT a.row_id,-1 FROM rows_a a JOIN {hot_table} hk ON hk.k=a.{col}
+        WHERE a.middle_name='' AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0 {clean_a}
+    """)
+
+    # Cross mode also needs complete A vs missing-Middle B. Rescue exact
+    # First+Last + full DOB/suffix without expanding the hot block.
+    if cross:
+        conn.execute("DROP TABLE IF EXISTS hot_missing_b_dob")
+        conn.execute(f"""
+            CREATE TEMP TABLE hot_missing_b_dob AS
+            SELECT b.first_name,b.last_name,b.birth_month_component,b.birth_day_component,b.birth_year_component,
+                   MIN(b.row_id) AS row_id,COUNT(*) AS n
+            FROM rows_b b JOIN {hot_table} hk ON hk.k=b.{col}
+            WHERE b.middle_name='' AND b.first_name<>'' AND b.last_name<>''
+              AND b.birth_month_component<>'' AND b.birth_day_component<>'' AND b.birth_year_component<>''
+              AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+            GROUP BY b.first_name,b.last_name,b.birth_month_component,b.birth_day_component,b.birth_year_component
+        """)
+        conn.execute("CREATE INDEX idx_hot_missing_b_dob ON hot_missing_b_dob(first_name,last_name,birth_month_component,birth_day_component,birth_year_component)")
+        conn.execute(f"""
+            INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+            SELECT a.row_id,p.row_id FROM rows_a a
+            JOIN {hot_table} hk ON hk.k=a.{col}
+            JOIN hot_missing_b_dob p
+              ON p.first_name=a.first_name AND p.last_name=a.last_name
+             AND p.birth_month_component=a.birth_month_component
+             AND p.birth_day_component=a.birth_day_component
+             AND p.birth_year_component=a.birth_year_component
+            WHERE a.middle_name<>'' AND p.n=1
+              AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0 {clean_a}
+        """)
+        conn.execute("DROP TABLE IF EXISTS hot_missing_b_suffix")
+        conn.execute(f"""
+            CREATE TEMP TABLE hot_missing_b_suffix AS
+            SELECT b.first_name,b.last_name,b.suffix_name,MIN(b.row_id) AS row_id,COUNT(*) AS n
+            FROM rows_b b JOIN {hot_table} hk ON hk.k=b.{col}
+            WHERE b.middle_name='' AND b.suffix_name<>'' AND b.first_name<>'' AND b.last_name<>''
+              AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+            GROUP BY b.first_name,b.last_name,b.suffix_name
+        """)
+        conn.execute("CREATE INDEX idx_hot_missing_b_suffix ON hot_missing_b_suffix(first_name,last_name,suffix_name)")
+        conn.execute(f"""
+            INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+            SELECT a.row_id,p.row_id FROM rows_a a
+            JOIN {hot_table} hk ON hk.k=a.{col}
+            JOIN hot_missing_b_suffix p
+              ON p.first_name=a.first_name AND p.last_name=a.last_name AND p.suffix_name=a.suffix_name
+            WHERE a.middle_name<>'' AND a.suffix_name<>'' AND p.n=1
+              AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0 {clean_a}
+        """)
+        conn.execute("DROP TABLE IF EXISTS hot_missing_b_dob")
+        conn.execute("DROP TABLE IF EXISTS hot_missing_b_suffix")
+
+    conn.execute("DROP TABLE IF EXISTS hot_mid_partner_dob")
+    conn.execute("DROP TABLE IF EXISTS hot_mid_partner_suffix")
+    after=int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidate_pairs").fetchone()[0])
+    return max(0,after-before)
+
+
+
+def _weak_matrix_db_dir(conn: sqlite3.Connection) -> Path:
+    """Return the private staging-database directory for temporary memmaps."""
+    rows = list(conn.execute("PRAGMA database_list"))
+    for _seq, name, filename in rows:
+        if str(name) == "main" and filename:
+            return Path(str(filename)).resolve().parent
+    return Path.cwd()
+
+
+def _load_weak_lane_matrix(
+    conn: sqlite3.Connection,
+    table: str,
+    row_count: int,
+    lanes: Sequence[str],
+    *,
+    use_clean_filter: bool,
+    force_memmap: bool,
+    log: LogFn,
+) -> tuple[np.ndarray, Path | None]:
+    """Load all weak sketch keys in one sequential scan.
+
+    The old engine performed one SQLite GROUP BY + temp sort for every weak lane.
+    This matrix reads the selected rows once, then NumPy performs each lane's
+    exact-cardinality analysis.  A disk-backed memmap is used automatically for
+    large matrices, so the optimization never imposes a record/candidate cap.
+    """
+    lane_sql = ",".join(f"r.{c}" for c in lanes)
+    clean_join = (
+        "JOIN fuzzy_clean_a ca ON ca.row_id=r.row_id"
+        if use_clean_filter and table == "rows_a" else ""
+    )
+    shape = (int(row_count), len(lanes))
+    byte_count = int(row_count) * len(lanes) * np.dtype(np.int64).itemsize
+    path: Path | None = None
+    if force_memmap:
+        path = _weak_matrix_db_dir(conn) / f"weak_{table}_{os.getpid()}_{time.time_ns()}.bin"
+        matrix = np.memmap(path, dtype=np.int64, mode="w+", shape=shape)
+        matrix[:] = 0
+        storage = "disk-backed"
+    else:
+        matrix = np.zeros(shape, dtype=np.int64)
+        storage = "RAM"
+
+    sql = f"""
+        SELECT r.row_id,{lane_sql}
+        FROM {table} r {clean_join}
+        WHERE (r.finding & {F_DEDUP_BLOCKING_FINDING})=0
+    """
+    cur = conn.execute(sql)
+    loaded = 0
+    while True:
+        batch = cur.fetchmany(WEAK_MATRIX_FETCH_ROWS)
+        if not batch:
+            break
+        arr = np.asarray(batch, dtype=np.int64)
+        ids = arr[:, 0]
+        matrix[ids, :] = arr[:, 1:]
+        loaded += len(arr)
+    if isinstance(matrix, np.memmap):
+        matrix.flush()
+    log(
+        f"Weak-lane accelerator: loaded {loaded:,} active {table} rows once "
+        f"into a {storage} {len(lanes)}-lane matrix ({byte_count / 1024 / 1024:.1f} MiB logical)."
+    )
+    return matrix, path
+
+
+def _singleton_key_rows(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return (key,row_id) only for nonzero keys occurring exactly once."""
+    ids = np.flatnonzero(values)
+    if len(ids) == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    keys = np.asarray(values[ids], dtype=np.int64)
+    order = np.argsort(keys, kind="mergesort")
+    sk = keys[order]
+    sr = ids[order].astype(np.int64, copy=False)
+    if len(sk) == 1:
+        return sk.copy(), sr.copy()
+    starts = np.r_[0, np.flatnonzero(sk[1:] != sk[:-1]) + 1]
+    ends = np.r_[starts[1:], len(sk)]
+    one = (ends - starts) == 1
+    pos = starts[one]
+    return sk[pos].copy(), sr[pos].copy()
+
+
+def _doubleton_row_pairs(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return the one possible row pair for every key occurring exactly twice."""
+    ids = np.flatnonzero(values)
+    if len(ids) < 2:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    keys = np.asarray(values[ids], dtype=np.int64)
+    order = np.argsort(keys, kind="mergesort")
+    sk = keys[order]
+    sr = ids[order].astype(np.int64, copy=False)
+    starts = np.r_[0, np.flatnonzero(sk[1:] != sk[:-1]) + 1]
+    ends = np.r_[starts[1:], len(sk)]
+    two = (ends - starts) == 2
+    pos = starts[two]
+    if len(pos) == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    p1 = sr[pos]
+    p2 = sr[pos + 1]
+    return np.minimum(p1, p2), np.maximum(p1, p2)
+
+
+def _insert_numpy_unique_weak_rescue(
+    conn: sqlite3.Connection,
+    *,
+    cross: bool,
+    use_clean_filter: bool,
+    lanes: Sequence[str],
+    unsupported_a: str,
+    unsupported_b: str,
+    middle_candidate_guard: str,
+    weak_edge_guard: str,
+    log: LogFn,
+) -> int:
+    """Replace repeated weak-lane SQL GROUP BY scans with NumPy cardinality search.
+
+    Coverage is identical to the previous unique-lane rule:
+      * within-file: every weak bucket containing exactly two eligible rows;
+      * cross-file: every weak key unique on A and unique on B.
+    There is no top-N, block cap, or candidate truncation.  The full fuzzy scorer
+    still validates every proposed relationship.
+    """
+    a_rows = int(conn.execute("SELECT COUNT(*) FROM rows_a").fetchone()[0])
+    b_rows = int(conn.execute("SELECT COUNT(*) FROM rows_b").fetchone()[0]) if cross else 0
+    logical_bytes = (a_rows + (b_rows if cross else 0)) * len(lanes) * np.dtype(np.int64).itemsize
+    force_memmap = logical_bytes >= WEAK_MATRIX_MEMMAP_SWITCH_BYTES
+
+    a_mat, a_path = _load_weak_lane_matrix(
+        conn, "rows_a", a_rows, lanes,
+        use_clean_filter=use_clean_filter,
+        force_memmap=force_memmap,
+        log=log,
+    )
+    b_mat: np.ndarray | None = None
+    b_path: Path | None = None
+    if cross:
+        b_mat, b_path = _load_weak_lane_matrix(
+            conn, "rows_b", b_rows, lanes,
+            use_clean_filter=False,
+            force_memmap=force_memmap,
+            log=log,
+        )
+
+    conn.execute("DROP TABLE IF EXISTS fuzzy_unique_raw")
+    conn.execute(
+        "CREATE TEMP TABLE fuzzy_unique_raw(a INTEGER NOT NULL,b INTEGER NOT NULL,PRIMARY KEY(a,b)) WITHOUT ROWID"
+    )
+    proposed = 0
+    try:
+        for lane_no, col in enumerate(lanes, start=1):
+            if cross:
+                assert b_mat is not None
+                ka, ra = _singleton_key_rows(a_mat[:, lane_no - 1])
+                kb, rb = _singleton_key_rows(b_mat[:, lane_no - 1])
+                if len(ka) and len(kb):
+                    _common, ia, ib = np.intersect1d(
+                        ka, kb, assume_unique=True, return_indices=True
+                    )
+                    pa = ra[ia]
+                    pb = rb[ib]
+                else:
+                    pa = np.empty(0, dtype=np.int64)
+                    pb = np.empty(0, dtype=np.int64)
+            else:
+                pa, pb = _doubleton_row_pairs(a_mat[:, lane_no - 1])
+
+            if len(pa):
+                conn.executemany(
+                    "INSERT OR IGNORE INTO fuzzy_unique_raw(a,b) VALUES (?,?)",
+                    ((int(x), int(y)) for x, y in zip(pa, pb)),
+                )
+                proposed += int(len(pa))
+            if lane_no in (1, len(lanes)) or lane_no % 4 == 0:
+                log(
+                    f"Weak-lane accelerator: analyzed {lane_no}/{len(lanes)} lanes; "
+                    f"{proposed:,} raw unique-partner proposals so far."
+                )
+
+        before = int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidate_pairs").fetchone()[0])
+        right = "rows_b" if cross else "rows_a"
+        conn.execute(f"""
+            INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+            SELECT u.a,u.b
+            FROM fuzzy_unique_raw u
+            JOIN rows_a a ON a.row_id=u.a
+            JOIN {right} b ON b.row_id=u.b
+            WHERE NOT {unsupported_a} AND NOT {unsupported_b}
+              AND {middle_candidate_guard} {weak_edge_guard}
+        """)
+        after = int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidate_pairs").fetchone()[0])
+        inserted = max(0, after - before)
+        log(
+            f"Weak-lane accelerator: {proposed:,} unique-partner proposals collapsed to "
+            f"{inserted:,} new verified candidate edge(s); coverage=ALL."
+        )
+        return inserted
+    finally:
+        conn.execute("DROP TABLE IF EXISTS fuzzy_unique_raw")
+        if isinstance(a_mat, np.memmap):
+            a_mat.flush()
+        if isinstance(b_mat, np.memmap):
+            b_mat.flush()
+        del a_mat
+        if b_mat is not None:
+            del b_mat
+        for path in (a_path, b_path):
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
+def _build_candidate_table(
+    conn: sqlite3.Connection,
+    cross: bool,
+    options: ScaleOptions,
+    rows: int,
+    log: LogFn,
+    use_clean_filter: bool = False,
+) -> None:
+    """Build name-core fuzzy candidates from strong composite name signatures.
+
+    Birthdate is never a candidate gate. Weak lead/tail-only blocks were removed
+    because common surnames and middle names could create millions of useless
+    comparisons. Every active lane below carries evidence from BOTH name edges
+    or from the whole multi-token name.
+    """
+    if options.exhaustive:
+        from engine.exhaustive import build_candidates
+        build_candidates(conn, cross, options, log)
+        return
+    conn.execute("DROP TABLE IF EXISTS fuzzy_candidate_pairs")
+    conn.execute("DROP TABLE IF EXISTS fuzzy_candidates")
+    conn.execute("CREATE TABLE fuzzy_candidate_pairs(a INTEGER NOT NULL,b INTEGER NOT NULL,PRIMARY KEY(a,b)) WITHOUT ROWID")
+    conn.execute("DROP TABLE IF EXISTS fuzzy_pre_review")
+    conn.execute("CREATE TEMP TABLE fuzzy_pre_review(a INTEGER PRIMARY KEY,b INTEGER NOT NULL DEFAULT -1) WITHOUT ROWID")
+
+    profile_edges = _insert_exact_supported_profile_edges(conn, cross, use_clean_filter)
+    if profile_edges:
+        log(f"Sparse profile compression inserted {profile_edges:,} lossless edge(s) for repeated supported identity profiles.")
+    hot_within_reducer = None if cross else _HotWithinReducer(int(rows))
+    if hot_within_reducer is not None and profile_edges:
+        # Seed the adaptive hot forest with the already-compressed exact-profile
+        # edges so later hot lanes never re-store relationships already known.
+        for _a,_b in conn.execute("SELECT a,b FROM fuzzy_candidate_pairs"):
+            hot_within_reducer.union(int(_a),int(_b))
+    # Multiple blocking lanes can identify the exact same hot row set. Cache
+    # those row-set fingerprints so one expensive profile comparison is reused
+    # instead of repeated lane by lane.
+    processed_hot_sets: set[tuple[Any, ...]] = set()
+    right = "rows_b" if cross else "rows_a"
+    relation = "1=1" if cross else "a.row_id<b.row_id"
+    if use_clean_filter and cross:
+        clean_join = "JOIN fuzzy_clean_a ca ON ca.row_id=a.row_id"
+    elif use_clean_filter:
+        clean_join = "JOIN fuzzy_clean_a ca ON ca.row_id=a.row_id JOIN fuzzy_clean_a cb ON cb.row_id=b.row_id"
+    else:
+        clean_join = ""
+    # Name evidence remains eligible for DUPLICATE RECORDS even when
+    # Middle/Suffix/DOB support is missing.  Candidate discovery therefore must
+    # not pre-route these rows to RECORDS FOR REVIEW.  True ambiguity and
+    # conflicting/invalid DOB findings are still handled separately.
+    unsupported_a = "0"
+    unsupported_b = "0"
+
+    # Candidate-level Middle Name pruning mirrors the hard middle gate without
+    # imposing a row/candidate cap. It is deliberately permissive: missing
+    # middle names remain eligible; exact/phonetic rescue is accepted; initial
+    # forms are accepted; and long full words only need a stable boundary clue
+    # before the expensive RapidFuzz scorer makes the final decision.
+    middle_candidate_guard = """
+        (
+            a.middle_name='' OR b.middle_name=''
+            OR a.middle_name=b.middle_name
+            OR (a.b10<>0 AND a.b10=b.b10)
+            OR (
+                (length(replace(a.middle_name,' ',''))<=2 OR length(replace(b.middle_name,' ',''))<=2)
+                AND substr(a.middle_name,1,1)=substr(b.middle_name,1,1)
+            )
+            OR (
+                abs(length(a.middle_name)-length(b.middle_name))<=2
+                AND (
+                    substr(a.middle_name,1,2)=substr(b.middle_name,1,2)
+                    OR substr(a.middle_name,-2)=substr(b.middle_name,-2)
+                    OR (a.b11<>0 AND a.b11=b.b11)
+                    OR (a.b12<>0 AND a.b12=b.b12)
+                )
+            )
+        )
+    """
+    # Keep the non-Middle safety predicates separate. Strong evidence lanes
+    # (for example exact DOB + exact First/Last) must be allowed to reach the
+    # final component scorer even when Middle itself contains an interior typo.
+    # v6.27 applied middle_candidate_guard globally, causing valid pairs such as
+    # SUXO/SXUO to disappear before RapidFuzz could score them.
+    base_common_where = f"""
+        (a.finding & {F_DEDUP_BLOCKING_FINDING})=0
+        AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+        AND NOT (a.final_key<>'' AND a.final_key=b.final_key)
+        AND NOT (a.swap_key<>'' AND a.swap_key=b.swap_key)
+        AND NOT (
+            a.first_name=b.first_name AND a.middle_name=b.middle_name
+            AND a.last_name=b.last_name AND a.suffix_name=b.suffix_name
+            AND (a.middle_name<>'' OR a.suffix_name<>'')
+        )
+        AND NOT {unsupported_a}
+        AND NOT {unsupported_b}
+        AND {relation}
+    """
+    common_where = f"""
+        {base_common_where}
+        AND {middle_candidate_guard}
+    """
+
+    # ------------------------------------------------------------------
+    # Joined / split-name spacing rescue
+    # ------------------------------------------------------------------
+    # The final name scorer already compares compact no-space forms, but a
+    # Full Name-only record such as "johnny bert" has two tokens while
+    # "johnnybert" has one. Older candidate blocks could therefore place them
+    # in different buckets and the pair was never scored.
+    #
+    # This rescue is intentionally narrow:
+    #   * normalized names must be DIFFERENT as stored;
+    #   * removing spaces must make them EXACTLY equal;
+    #   * compact length must be at least 4;
+    #   * ordinary finding / Middle / support gates remain active.
+    #
+    # It does NOT use substring containment, so "johnny bert" does not become
+    # equal to "johnny berton".
+    compact_a = "replace(a.name,' ','')"
+    compact_b = "replace(b.name,' ','')"
+
+    compact_clean_join = clean_join
+    compact_before = int(conn.execute(
+        "SELECT COUNT(*) FROM fuzzy_candidate_pairs"
+    ).fetchone()[0])
+
+    # Unsupported structured rows cannot become automatic fuzzy duplicates
+    # under the existing evidence rules. Preserve them as Review when a
+    # spacing-only counterpart exists instead of silently losing the clue.
+    if cross:
+        conn.execute(f"""
+            INSERT OR IGNORE INTO fuzzy_pre_review(a,b)
+            SELECT a.row_id, COALESCE((
+                SELECT b.row_id
+                FROM rows_b b
+                WHERE replace(b.name,' ','')=replace(a.name,' ','')
+                  AND b.name<>a.name
+                  AND length(replace(b.name,' ',''))>=4
+                  AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+                LIMIT 1
+            ), -1)
+            FROM rows_a a
+            WHERE a.name<>'' AND {unsupported_a}
+              AND length(replace(a.name,' ',''))>=4
+              AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0
+              AND EXISTS (
+                SELECT 1 FROM rows_b b
+                WHERE replace(b.name,' ','')=replace(a.name,' ','')
+                  AND b.name<>a.name
+                  AND length(replace(b.name,' ',''))>=4
+                  AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+              )
+        """)
+    else:
+        conn.execute(f"""
+            INSERT OR IGNORE INTO fuzzy_pre_review(a,b)
+            SELECT a.row_id, COALESCE((
+                SELECT b.row_id
+                FROM rows_a b
+                WHERE b.row_id<>a.row_id
+                  AND replace(b.name,' ','')=replace(a.name,' ','')
+                  AND b.name<>a.name
+                  AND length(replace(b.name,' ',''))>=4
+                  AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+                LIMIT 1
+            ), -1)
+            FROM rows_a a
+            WHERE a.name<>'' AND {unsupported_a}
+              AND length(replace(a.name,' ',''))>=4
+              AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0
+              AND EXISTS (
+                SELECT 1 FROM rows_a b
+                WHERE b.row_id<>a.row_id
+                  AND replace(b.name,' ','')=replace(a.name,' ','')
+                  AND b.name<>a.name
+                  AND length(replace(b.name,' ',''))>=4
+                  AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+              )
+        """)
+
+    conn.execute(f"""
+        INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+        SELECT a.row_id,b.row_id
+        FROM rows_a a
+        JOIN {right} b
+          ON replace(a.name,' ','')=replace(b.name,' ','')
+        {compact_clean_join}
+        WHERE a.name<>'' AND b.name<>''
+          AND a.name<>b.name
+          AND length(replace(a.name,' ',''))>=4
+          AND {common_where}
+    """)
+
+    compact_after = int(conn.execute(
+        "SELECT COUNT(*) FROM fuzzy_candidate_pairs"
+    ).fetchone()[0])
+    compact_added = max(0, compact_after - compact_before)
+    if compact_added:
+        log(
+            f"Joined/split-name rescue added {compact_added:,} candidate edge(s) "
+            f"where names differ only by spacing."
+        )
+    conn.commit()
+
+    # Combined spacing + conservative spelling rescue.
+    #
+    # These all share one exact compact phonetic key:
+    #   CARL CUPID / CARLCUPID / KARL CUPID / KARLCUPID
+    #
+    # This is an indexed equality join, not substring or prefix matching.
+    phon_name_a = (
+        "replace("
+        "replace("
+        "replace("
+        "replace("
+        "replace("
+        "replace(a.name,'q','k'),"
+        "'k','c'),"
+        "'ph','f'),"
+        "'z','s'),"
+        "'v','b'),"
+        "' ','')"
+    )
+    phon_name_b = (
+        "replace("
+        "replace("
+        "replace("
+        "replace("
+        "replace("
+        "replace(b.name,'q','k'),"
+        "'k','c'),"
+        "'ph','f'),"
+        "'z','s'),"
+        "'v','b'),"
+        "' ','')"
+    )
+
+    phon_compact_before = int(conn.execute(
+        "SELECT COUNT(*) FROM fuzzy_candidate_pairs"
+    ).fetchone()[0])
+
+    conn.execute(f"""
+        INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+        SELECT a.row_id,b.row_id
+        FROM rows_a a
+        JOIN {right} b
+          ON {phon_name_a}={phon_name_b}
+        {clean_join}
+        WHERE a.name<>'' AND b.name<>''
+          AND a.name<>b.name
+          AND length({phon_name_a})>=6
+          AND {common_where}
+    """)
+
+    phon_compact_after = int(conn.execute(
+        "SELECT COUNT(*) FROM fuzzy_candidate_pairs"
+    ).fetchone()[0])
+    phon_compact_added = max(0, phon_compact_after - phon_compact_before)
+    if phon_compact_added:
+        log(
+            f"Compact phonetic name rescue added {phon_compact_added:,} "
+            f"candidate edge(s) for spacing + spelling variants."
+        )
+    conn.commit()
+
+
+    # ------------------------------------------------------------------
+    # DOB-assisted candidate discovery (v6.27)
+    # ------------------------------------------------------------------
+    # DOB is supporting/discovery evidence, never a substitute for the final
+    # name threshold. Exact DOB + one exact edge name allows the opposite edge
+    # to contain a typo/transposition and still reach the final RapidFuzz scorer.
+    # This applies equally to Self Dedup and Cross Match.
+    dob_discovery_before = int(conn.execute(
+        "SELECT COUNT(*) FROM fuzzy_candidate_pairs"
+    ).fetchone()[0])
+    conn.execute(f"""
+        INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+        SELECT a.row_id,b.row_id
+        FROM rows_a a
+        JOIN {right} b
+          ON a.birth<>'' AND a.birth=b.birth
+        {clean_join}
+        WHERE {base_common_where}
+          AND (
+            (
+              a.last_name<>'' AND a.last_name=b.last_name
+              AND a.first_name<>'' AND b.first_name<>''
+              AND substr(a.first_name,1,1)=substr(b.first_name,1,1)
+            )
+            OR
+            (
+              a.first_name<>'' AND a.first_name=b.first_name
+              AND a.last_name<>'' AND b.last_name<>''
+              AND substr(a.last_name,1,1)=substr(b.last_name,1,1)
+            )
+          )
+    """)
+
+    # Stress-hardened dual-edge rescue: when DOB is exact and a strong interior
+    # identity component (Middle or Suffix) agrees exactly, allow BOTH First and
+    # Last to contain small spelling/transposition errors. This remains sparse:
+    # both edge initials must agree and edge lengths may differ by at most 2.
+    # Final acceptance still requires the configured >=80 component/name rules.
+    conn.execute(f"""
+        INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+        SELECT a.row_id,b.row_id
+        FROM rows_a a
+        JOIN {right} b
+          ON a.birth<>'' AND a.birth=b.birth
+        {clean_join}
+        WHERE {base_common_where}
+          AND a.first_name<>'' AND b.first_name<>''
+          AND a.last_name<>'' AND b.last_name<>''
+          AND substr(a.first_name,1,1)=substr(b.first_name,1,1)
+          AND substr(a.last_name,1,1)=substr(b.last_name,1,1)
+          AND abs(length(a.first_name)-length(b.first_name))<=2
+          AND abs(length(a.last_name)-length(b.last_name))<=2
+          AND (
+              (a.middle_name<>'' AND a.middle_name=b.middle_name)
+              OR (a.suffix_name<>'' AND a.suffix_name=b.suffix_name)
+          )
+    """)
+    dob_discovery_after = int(conn.execute(
+        "SELECT COUNT(*) FROM fuzzy_candidate_pairs"
+    ).fetchone()[0])
+    dob_discovery_added = max(0, dob_discovery_after - dob_discovery_before)
+    if dob_discovery_added:
+        log(
+            f"DOB-assisted name discovery added {dob_discovery_added:,} candidate edge(s) "
+            "with exact DOB + one exact First/Last anchor."
+        )
+    conn.commit()
+
+    # ------------------------------------------------------------------
+    # Structured First/Last initial rescue
+    # ------------------------------------------------------------------
+    # Initial forms have too little information for automatic duplication, but
+    # they should not disappear as Clean when DOB + Middle/Suffix + the opposite
+    # edge name strongly agree. This sparse lane requires exact DOB and an exact
+    # opposite edge anchor before the scorer may route the pair to Review.
+    initial_before = int(conn.execute(
+        "SELECT COUNT(*) FROM fuzzy_candidate_pairs"
+    ).fetchone()[0])
+
+    conn.execute(f"""
+        INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+        SELECT a.row_id,b.row_id
+        FROM rows_a a
+        JOIN {right} b
+          ON a.birth<>'' AND a.birth=b.birth
+        {clean_join}
+        WHERE {common_where}
+          AND (
+            (
+              a.last_name<>'' AND a.last_name=b.last_name
+              AND substr(replace(a.first_name,' ',''),1,1)=substr(replace(b.first_name,' ',''),1,1)
+              AND (
+                length(replace(a.first_name,' ',''))<=2
+                OR length(replace(b.first_name,' ',''))<=2
+              )
+            )
+            OR
+            (
+              a.first_name<>'' AND a.first_name=b.first_name
+              AND substr(replace(a.last_name,' ',''),1,1)=substr(replace(b.last_name,' ',''),1,1)
+              AND (
+                length(replace(a.last_name,' ',''))<=2
+                OR length(replace(b.last_name,' ',''))<=2
+              )
+            )
+          )
+          AND (
+            (a.middle_name<>'' AND a.middle_name=b.middle_name)
+            OR
+            (a.suffix_name<>'' AND a.suffix_name=b.suffix_name)
+          )
+    """)
+
+    initial_after = int(conn.execute(
+        "SELECT COUNT(*) FROM fuzzy_candidate_pairs"
+    ).fetchone()[0])
+    initial_added = max(0, initial_after - initial_before)
+    if initial_added:
+        log(
+            f"Structured initial rescue added {initial_added:,} candidate edge(s) "
+            f"for conservative manual Review."
+        )
+    conn.commit()
+
+    # ------------------------------------------------------------------
+    # Large-file supported one-anchor typo rescue
+    # ------------------------------------------------------------------
+    # For 500K-1M data, preserve the important MICHAEL/MICHEAL-style Review
+    # path without using globally broad boundary blocks. Exact DOB + one exact
+    # structured edge makes these joins selective and audit-safe.
+    if int(rows) >= LARGE_FUZZY_WEAK_RESCUE_THRESHOLD:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_a_birth_last ON rows_a(birth,last_name,row_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_a_birth_first ON rows_a(birth,first_name,row_id)")
+        if cross:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_b_birth_last ON rows_b(birth,last_name,row_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_b_birth_first ON rows_b(birth,first_name,row_id)")
+
+        typo_before = int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidate_pairs").fetchone()[0])
+        conn.execute(f"""
+            INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+            SELECT a.row_id,b.row_id
+            FROM rows_a a
+            JOIN {right} b
+              ON a.birth<>'' AND a.birth=b.birth
+             AND (
+                  (a.last_name<>'' AND a.last_name=b.last_name
+                   AND substr(a.first_name,1,1)=substr(b.first_name,1,1)
+                   AND a.first_name<>b.first_name)
+                  OR
+                  (a.first_name<>'' AND a.first_name=b.first_name
+                   AND substr(a.last_name,1,1)=substr(b.last_name,1,1)
+                   AND a.last_name<>b.last_name)
+             )
+            {clean_join}
+            WHERE {common_where}
+        """)
+        typo_after = int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidate_pairs").fetchone()[0])
+        if typo_after > typo_before:
+            log(
+                f"Large-file supported typo rescue added {typo_after-typo_before:,} "
+                "DOB-anchored candidate edge(s)."
+            )
+        conn.commit()
+
+    # b4/b5: exact strong ordered/unordered phonetic edge signatures.
+    # b6-b9: typo-tolerant first+last boundary shapes, normal and swap-invariant.
+    # b10: selective middle-name rescue with both edge boundaries.
+    # b11/b12: whole-name token-shape multisets for Full Name-only/reordered data.
+    if int(rows) >= LARGE_FUZZY_WEAK_RESCUE_THRESHOLD:
+        # b8/b9 are deliberately broad typo-boundary signatures. On very large
+        # files, a handful of common-name buckets can contain tens of thousands
+        # of profiles and turn an otherwise linear run into an exhaustive dense
+        # comparison. Exact/phonetic compact rescue plus b4/b5/b10/b11/b12 and
+        # supported-DOB typo rescue preserve the useful high-confidence paths.
+        candidate_blocks = ("b4", "b5", "b10", "b11")
+        log(
+            "Large-file fuzzy optimizer: broad b8/b9 boundary blocks disabled; "
+            "selective strong blocks and supported typo rescue remain active."
+        )
+    else:
+        candidate_blocks = ("b4", "b5", "b8", "b9", "b10", "b11", "b12")
+    hot_direct_total = 0
+    for no, col in enumerate(candidate_blocks, start=1):
+        # Mark unsupported A rows when this strong block proves at least one
+        # possible same-person candidate exists. Correlated LIMIT 1 uses the
+        # block index and avoids materializing every pair.
+        a_clean_exists = (
+            "AND EXISTS (SELECT 1 FROM fuzzy_clean_a ca WHERE ca.row_id=a.row_id)"
+            if use_clean_filter else ""
+        )
+        if cross:
+            partner_table = "rows_b"
+            partner_extra = ""
+        else:
+            partner_table = "rows_a"
+            partner_extra = (
+                "AND EXISTS (SELECT 1 FROM fuzzy_clean_a cb WHERE cb.row_id=b.row_id)"
+                if use_clean_filter else ""
+            )
+        conn.execute(f"""
+            INSERT OR IGNORE INTO fuzzy_pre_review(a,b)
+            SELECT a.row_id, COALESCE((
+                SELECT b.row_id FROM {partner_table} b
+                WHERE b.{col}=a.{col} AND b.{col}<>0
+                  AND b.row_id<>a.row_id
+                  AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+                  {partner_extra}
+                LIMIT 1
+            ), -1)
+            FROM rows_a a
+            WHERE a.{col}<>0 AND {unsupported_a}
+              AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0
+              {a_clean_exists}
+              AND EXISTS (
+                SELECT 1 FROM {partner_table} b
+                WHERE b.{col}=a.{col} AND b.{col}<>0
+                  AND b.row_id<>a.row_id
+                  AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+                  {partner_extra}
+              )
+        """)
+        if cross:
+            # A may have enough DOB itself but an unsupported B reference still
+            # cannot provide the two-sided support needed for automatic fuzzy.
+            conn.execute(f"""
+                INSERT OR IGNORE INTO fuzzy_pre_review(a,b)
+                SELECT a.row_id, COALESCE((
+                    SELECT b.row_id FROM rows_b b
+                    WHERE b.{col}=a.{col} AND b.{col}<>0 AND {unsupported_b}
+                      AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+                    LIMIT 1
+                ), -1)
+                FROM rows_a a
+                WHERE a.{col}<>0 AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0
+                  {a_clean_exists}
+                  AND EXISTS (
+                    SELECT 1 FROM rows_b b
+                    WHERE b.{col}=a.{col} AND b.{col}<>0 AND {unsupported_b}
+                      AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+                  )
+            """)
+
+        uniform_keys = _hot_uniform_supported_keys(conn, col, cross, use_clean_filter)
+        uniform_table = f"fuzzy_uniform_{col}"
+        conn.execute(f"DROP TABLE IF EXISTS {uniform_table}")
+        uniform_exclusion = ""
+        if uniform_keys:
+            conn.execute(f"CREATE TEMP TABLE {uniform_table}(k INTEGER PRIMARY KEY) WITHOUT ROWID")
+            conn.executemany(f"INSERT INTO {uniform_table}(k) VALUES (?)", ((int(k),) for k in uniform_keys))
+            uniform_exclusion = f"AND NOT EXISTS (SELECT 1 FROM {uniform_table} uk WHERE uk.k=a.{col})"
+            log(f"Sparse profile compression bypassed Cartesian joins for {len(uniform_keys):,} uniform high-cost {col} block(s).")
+
+        hot_keys = [k for k in _hot_complete_middle_keys(conn, col, cross, use_clean_filter) if k not in set(uniform_keys)]
+        hot_table = f"fuzzy_hot_{col}"
+        conn.execute(f"DROP TABLE IF EXISTS {hot_table}")
+        hot_exclusion = ""
+        if hot_keys:
+            conn.execute(f"CREATE TEMP TABLE {hot_table}(k INTEGER PRIMARY KEY) WITHOUT ROWID")
+            conn.executemany(f"INSERT INTO {hot_table}(k) VALUES (?)", ((int(k),) for k in hot_keys))
+            # Exclude the entire hot key from the ordinary Cartesian join.
+            # Complete-middle pairs are handled by the profile engine; missing-
+            # middle pairs are reintroduced separately below. This changes the
+            # join cost itself rather than filtering after the explosion.
+            hot_exclusion = f"AND NOT EXISTS (SELECT 1 FROM {hot_table} hk WHERE hk.k=a.{col})"
+            log(
+                f"Adaptive hot-block discovery: {col} has {len(hot_keys):,} high-cost complete-middle block(s); "
+                f"switching those blocks from Cartesian SQL to profile-level RapidFuzz."
+            )
+            for key in hot_keys:
+                hot_direct_total += _process_hot_complete_middle_block(
+                    conn, col, int(key), cross, options, use_clean_filter, processed_hot_sets, hot_within_reducer
+                )
+
+        log(f"Name-core fuzzy discovery: {col} ({no}/{len(candidate_blocks)}), birthdate-independent.")
+        run_cold_join = True
+        if hot_keys or uniform_keys:
+            # If every populated A key is handled by an adaptive path, skip the
+            # ordinary join completely instead of asking SQLite to prove zero.
+            hot_probe = f"AND NOT EXISTS (SELECT 1 FROM {hot_table} hk WHERE hk.k=a.{col})" if hot_keys else ""
+            uniform_probe = f"AND NOT EXISTS (SELECT 1 FROM {uniform_table} uk WHERE uk.k=a.{col})" if uniform_keys else ""
+            run_cold_join = conn.execute(f"""
+                SELECT 1 FROM rows_a a
+                WHERE a.{col}<>0 {hot_probe} {uniform_probe}
+                LIMIT 1
+            """).fetchone() is not None
+        if run_cold_join:
+            cold_source = "rows_a"
+            if hot_keys or uniform_keys:
+                # Physically materialize only cold A rows. A WHERE-level anti-join
+                # can still let SQLite enter the hot Cartesian block before it
+                # applies the filter; this temp driver removes hot rows before
+                # the equality join exists at all.
+                cold_table=f"fuzzy_cold_{col}"
+                conn.execute(f"DROP TABLE IF EXISTS {cold_table}")
+                hot_probe = f"AND NOT EXISTS (SELECT 1 FROM {hot_table} hk WHERE hk.k=a.{col})" if hot_keys else ""
+                uniform_probe = f"AND NOT EXISTS (SELECT 1 FROM {uniform_table} uk WHERE uk.k=a.{col})" if uniform_keys else ""
+                clean_probe = "AND EXISTS (SELECT 1 FROM fuzzy_clean_a ca WHERE ca.row_id=a.row_id)" if use_clean_filter else ""
+                conn.execute(f"""
+                    CREATE TEMP TABLE {cold_table} AS
+                    SELECT a.* FROM rows_a a
+                    WHERE a.{col}<>0 {hot_probe} {uniform_probe} {clean_probe}
+                """)
+                conn.execute(f"CREATE INDEX idx_{cold_table}_{col} ON {cold_table}({col},row_id)")
+                cold_source=cold_table
+                cold_clean_join=""
+                cold_hot_exclusion=""
+                cold_uniform_exclusion=""
+            else:
+                cold_clean_join=clean_join
+                cold_hot_exclusion=hot_exclusion
+                cold_uniform_exclusion=uniform_exclusion
+            conn.execute(f"""
+                INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+                SELECT a.row_id,b.row_id
+                FROM {cold_source} a
+                JOIN {right} b ON a.{col}=b.{col}
+                {cold_clean_join}
+                WHERE a.{col}<>0 AND {common_where}
+                  {cold_hot_exclusion}
+                  {cold_uniform_exclusion}
+            """)
+            if cold_source != "rows_a":
+                conn.execute(f"DROP TABLE IF EXISTS {cold_source}")
+        if hot_keys:
+            rescued = _rescue_hot_missing_middle(conn, col, hot_table, cross, use_clean_filter)
+            if rescued:
+                log(f"Hot missing-Middle rescue inserted {rescued:,} sparse supported candidate edge(s) for {col}.")
+            conn.execute(f"DROP TABLE IF EXISTS {hot_table}")
+        if uniform_keys:
+            conn.execute(f"DROP TABLE IF EXISTS {uniform_table}")
+    conn.commit()
+    if hot_direct_total:
+        log(f"Adaptive hot-block engine inserted {hot_direct_total:,} sparse profile edge(s) from high-cost direct blocks.")
+
+    # ------------------------------------------------------------------
+    # Adaptive weak-sketch rescue (v6.23)
+    # ------------------------------------------------------------------
+    # Single MinHash/fragment buckets are intentionally weak evidence. Joining
+    # every row in one such bucket is the source of the old quadratic candidate
+    # storms. Instead, require agreement across two independent weak sketches
+    # before materializing a candidate. There is NO top-N or per-row candidate
+    # cap: every row in every selective composite bucket is still considered.
+    # A composite bucket that is itself non-selective is preserved as Review,
+    # because it no longer carries enough identity information for safe auto
+    # pairing. Rare one-lane buckets with exactly one possible partner are also
+    # rescued separately below.
+    weak_bands = (
+        # MinHash + terminal fragment cross-family bands. These are deliberately
+        # independent evidence families and were the highest-recall rescue in
+        # red-team mutation tests.
+        ("b1","b17"),("b2","b17"),("b3","b17"),
+        ("b13","b17"),("b14","b17"),("b15","b17"),
+        # Additional MinHash agreement bands.
+        ("b1","b14"),("b2","b15"),("b3","b13"),("b13","b15"),
+        # Fragment-family agreement bands.
+        ("b16","b17"),("b18","b19"),("b19","b20"),
+    )
+    weak_single_lanes=("b1","b2","b3","b13","b14","b15","b16","b17","b18","b19","b20")
+
+    # At 500K-1M scale, globally materializing every weak MinHash/fragment
+    # agreement can become super-linear on repetitive government name data.
+    # Strong composite lanes, compact/phonetic rescue, initials, and hot-block
+    # profile matching remain active. Weak-only evidence is too ambiguous for
+    # an automatic duplicate at this scale, so skip those global weak joins
+    # instead of letting them create millions of low-information pairs.
+    large_weak_rescue_skipped = int(rows) >= LARGE_FUZZY_WEAK_RESCUE_THRESHOLD
+    if large_weak_rescue_skipped:
+        weak_bands = ()
+        weak_single_lanes = ()
+        log(
+            f"Large-file fuzzy optimizer: {rows:,} source rows; "
+            "global weak-sketch Cartesian rescue disabled. Strong/high-recall "
+            "indexed lanes remain active; weak-only ambiguity is not auto-merged."
+        )
+
+    weak_edge_guard = """
+      AND (
+          a.first_name='' OR a.last_name='' OR b.first_name='' OR b.last_name=''
+          OR (
+              (
+                (substr(a.first_name,1,2)=substr(b.first_name,1,2) OR substr(a.first_name,-2)=substr(b.first_name,-2))
+                AND
+                (substr(a.last_name,1,2)=substr(b.last_name,1,2) OR substr(a.last_name,-2)=substr(b.last_name,-2))
+              )
+              OR
+              (
+                (substr(a.first_name,1,2)=substr(b.last_name,1,2) OR substr(a.first_name,-2)=substr(b.last_name,-2))
+                AND
+                (substr(a.last_name,1,2)=substr(b.first_name,1,2) OR substr(a.last_name,-2)=substr(b.first_name,-2))
+              )
+          )
+      )
+    """
+
+    adaptive_review_ids: set[int] = set()
+    weak_band_inserted_before=int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidate_pairs").fetchone()[0])
+    for band_no,(wx,wy) in enumerate(weak_bands, start=1):
+        conn.execute("DROP TABLE IF EXISTS fuzzy_band_a")
+        clean_probe="AND EXISTS (SELECT 1 FROM fuzzy_clean_a ca WHERE ca.row_id=r.row_id)" if use_clean_filter else ""
+        conn.execute(f"""
+            CREATE TEMP TABLE fuzzy_band_a AS
+            SELECT r.row_id,r.{wx} AS x,r.{wy} AS y
+            FROM rows_a r
+            WHERE r.{wx}<>0 AND r.{wy}<>0
+              AND (r.finding & {F_DEDUP_BLOCKING_FINDING})=0
+              {clean_probe}
+        """)
+        conn.execute("CREATE INDEX idx_fuzzy_band_a_xy ON fuzzy_band_a(x,y,row_id)")
+        if cross:
+            conn.execute("DROP TABLE IF EXISTS fuzzy_band_b")
+            conn.execute(f"""
+                CREATE TEMP TABLE fuzzy_band_b AS
+                SELECT r.row_id,r.{wx} AS x,r.{wy} AS y
+                FROM rows_b r
+                WHERE r.{wx}<>0 AND r.{wy}<>0
+                  AND (r.finding & {F_DEDUP_BLOCKING_FINDING})=0
+            """)
+            conn.execute("CREATE INDEX idx_fuzzy_band_b_xy ON fuzzy_band_b(x,y,row_id)")
+            hot_rows=list(conn.execute("""
+                WITH ac AS (SELECT x,y,COUNT(*) n FROM fuzzy_band_a GROUP BY x,y),
+                     bc AS (SELECT x,y,COUNT(*) n FROM fuzzy_band_b GROUP BY x,y)
+                SELECT ac.x,ac.y FROM ac JOIN bc USING(x,y)
+                WHERE ac.n*bc.n>?
+            """,(int(HOT_BLOCK_SWITCH_PAIRS),)))
+        else:
+            hot_rows=list(conn.execute("""
+                SELECT x,y FROM fuzzy_band_a GROUP BY x,y
+                HAVING (COUNT(*)*(COUNT(*)-1))/2>?
+            """,(int(HOT_BLOCK_SWITCH_PAIRS),)))
+
+        conn.execute("DROP TABLE IF EXISTS fuzzy_band_hot")
+        if hot_rows:
+            conn.execute("CREATE TEMP TABLE fuzzy_band_hot(x INTEGER,y INTEGER,PRIMARY KEY(x,y)) WITHOUT ROWID")
+            conn.executemany("INSERT INTO fuzzy_band_hot(x,y) VALUES (?,?)",((int(x),int(y)) for x,y in hot_rows))
+            # Walk only known hot composite keys; the review set is at most one
+            # entry per File-A row, independent of raw pair cardinality.
+            # A dense weak composite bucket has insufficient information
+            # content to justify either an automatic candidate OR a Review flag.
+            # Treat it like a stop-word collision and let stronger evidence lanes
+            # decide the row. No record is discarded; only this weak signal is.
+            pass
+
+        # Physically materialize cold composite buckets so SQLite never enters
+        # a known dense Cartesian group and filters it afterward.
+        conn.execute("DROP TABLE IF EXISTS fuzzy_band_cold_a")
+        hot_excl="AND NOT EXISTS (SELECT 1 FROM fuzzy_band_hot h WHERE h.x=ba.x AND h.y=ba.y)" if hot_rows else ""
+        conn.execute(f"CREATE TEMP TABLE fuzzy_band_cold_a AS SELECT ba.* FROM fuzzy_band_a ba WHERE 1=1 {hot_excl}")
+        conn.execute("CREATE INDEX idx_fuzzy_band_cold_a_xy ON fuzzy_band_cold_a(x,y,row_id)")
+        if cross:
+            right_band="fuzzy_band_b"
+            rel="1=1"
+        else:
+            right_band="fuzzy_band_a"
+            rel="la.row_id<lb.row_id"
+        conn.execute(f"""
+            INSERT OR IGNORE INTO fuzzy_candidate_pairs(a,b)
+            SELECT la.row_id,lb.row_id
+            FROM fuzzy_band_cold_a la
+            JOIN {right_band} lb ON la.x=lb.x AND la.y=lb.y
+            JOIN rows_a a ON a.row_id=la.row_id
+            JOIN {right} b ON b.row_id=lb.row_id
+            WHERE {rel}
+              AND (a.finding & {F_DEDUP_BLOCKING_FINDING})=0
+              AND (b.finding & {F_DEDUP_BLOCKING_FINDING})=0
+              AND NOT {unsupported_a}
+              AND NOT {unsupported_b}
+              AND NOT (a.final_key<>'' AND a.final_key=b.final_key)
+              AND NOT (a.swap_key<>'' AND a.swap_key=b.swap_key)
+              AND NOT (
+                  a.first_name=b.first_name AND a.middle_name=b.middle_name
+                  AND a.last_name=b.last_name AND a.suffix_name=b.suffix_name
+                  AND (a.middle_name<>'' OR a.suffix_name<>'')
+              )
+              AND {middle_candidate_guard}
+              {weak_edge_guard}
+        """)
+        conn.execute("DROP TABLE IF EXISTS fuzzy_band_cold_a")
+        conn.execute("DROP TABLE IF EXISTS fuzzy_band_hot")
+        conn.execute("DROP TABLE IF EXISTS fuzzy_band_a")
+        if cross:
+            conn.execute("DROP TABLE IF EXISTS fuzzy_band_b")
+        if band_no in (1,len(weak_bands)):
+            log(f"Adaptive weak-sketch rescue: composite band {band_no}/{len(weak_bands)} processed.")
+
+    # Unique one-lane rescue, accelerated.  The old implementation executed
+    # eleven full-table SQLite GROUP BY + temporary-sort passes.  v6.23 loads
+    # all weak keys once and performs exact cardinality analysis with NumPy (or
+    # a disk-backed memmap on large jobs).  Matching coverage is unchanged.
+    if weak_single_lanes:
+        _insert_numpy_unique_weak_rescue(
+            conn,
+            cross=cross,
+            use_clean_filter=use_clean_filter,
+            lanes=weak_single_lanes,
+            unsupported_a=unsupported_a,
+            unsupported_b=unsupported_b,
+            middle_candidate_guard=middle_candidate_guard,
+            weak_edge_guard=weak_edge_guard,
+            log=log,
+        )
+
+    if adaptive_review_ids:
+        # Retained for forward compatibility; current weak dense buckets are
+        # deliberately treated as non-informative rather than ambiguous.
+        conn.executemany(
+            "INSERT OR IGNORE INTO fuzzy_pre_review(a,b) VALUES (?,-1)",
+            ((int(rid),) for rid in adaptive_review_ids),
+        )
+    weak_band_inserted_after=int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidate_pairs").fetchone()[0])
+    log(f"Adaptive weak-sketch rescue added {max(0,weak_band_inserted_after-weak_band_inserted_before):,} unique candidate edge(s) before configured limits.")
+    conn.commit()
+
+    # ------------------------------------------------------------------
+    # Configurable fuzzy coverage controls restored.
+    #
+    # Birth-year gate:
+    #   Both records have a usable year -> require abs(year gap) <= window.
+    #   Missing year on either side remains eligible.
+    #
+    # Fuzzy block cap:
+    #   A record with more than N discovered fuzzy neighbours is treated as
+    #   ambiguous Review instead of scoring an unbounded dense neighbourhood.
+    #
+    # Candidate cap:
+    #   Applied later after evidence ranking; keeps the strongest N candidates
+    #   for each File-A row.
+    # ------------------------------------------------------------------
+    birth_window = int(options.fuzzy_birth_year_window)
+    if birth_window >= 0:
+        before_gate = int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidate_pairs").fetchone()[0])
+        conn.execute(f"""
+            DELETE FROM fuzzy_candidate_pairs
+            WHERE EXISTS (
+                SELECT 1
+                FROM rows_a a
+                JOIN {right} b
+                  ON a.row_id=fuzzy_candidate_pairs.a
+                 AND b.row_id=fuzzy_candidate_pairs.b
+                WHERE a.byear>0 AND b.byear>0
+                  AND ABS(a.byear-b.byear)>?
+            )
+        """, (birth_window,))
+        after_gate = int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidate_pairs").fetchone()[0])
+        log(
+            f"Birth-year gate ±{birth_window}: removed "
+            f"{max(0,before_gate-after_gate):,} candidate pair(s) with known years outside the window."
+        )
+
+    block_limit = int(options.fuzzy_block_limit)
+    if block_limit > 0:
+        conn.execute("DROP TABLE IF EXISTS fuzzy_over_block")
+        if cross:
+            conn.execute("""
+                CREATE TEMP TABLE fuzzy_over_block AS
+                SELECT a AS row_id, COUNT(*) AS n, MIN(b) AS partner
+                FROM fuzzy_candidate_pairs
+                GROUP BY a
+                HAVING COUNT(*)>?
+            """, (block_limit,))
+        else:
+            conn.execute("""
+                CREATE TEMP TABLE fuzzy_over_block AS
+                WITH e AS (
+                    SELECT a AS row_id,b AS partner FROM fuzzy_candidate_pairs
+                    UNION ALL
+                    SELECT b AS row_id,a AS partner FROM fuzzy_candidate_pairs
+                )
+                SELECT row_id,COUNT(*) AS n,MIN(partner) AS partner
+                FROM e
+                GROUP BY row_id
+                HAVING COUNT(*)>?
+            """, (block_limit,))
+        over_count = int(conn.execute("SELECT COUNT(*) FROM fuzzy_over_block").fetchone()[0])
+        if over_count:
+            conn.execute("""
+                INSERT OR IGNORE INTO fuzzy_pre_review(a,b)
+                SELECT row_id,partner FROM fuzzy_over_block
+            """)
+            if cross:
+                conn.execute("""
+                    DELETE FROM fuzzy_candidate_pairs
+                    WHERE a IN (SELECT row_id FROM fuzzy_over_block)
+                """)
+            else:
+                conn.execute("""
+                    DELETE FROM fuzzy_candidate_pairs
+                    WHERE a IN (SELECT row_id FROM fuzzy_over_block)
+                       OR b IN (SELECT row_id FROM fuzzy_over_block)
+                """)
+            log(
+                f"Fuzzy block cap {block_limit}: routed {over_count:,} dense record(s) "
+                f"to Review instead of automatic fuzzy scoring."
+            )
+        conn.execute("DROP TABLE IF EXISTS fuzzy_over_block")
+        conn.commit()
+
+    evidence_terms = [
+        ("b1",2),("b2",2),("b3",2),("b4",4),("b5",4),("b8",3),("b9",3),
+        ("b10",3),("b11",3),("b12",3),("b13",2),("b14",2),("b15",2),("b16",2),("b17",2),
+        ("b18",2),("b19",2),("b20",2),
+    ]
+    evidence_sql = " + ".join([f"CASE WHEN a.{c}<>0 AND a.{c}=b.{c} THEN {w} ELSE 0 END" for c,w in evidence_terms])
+    hits_sql = " + ".join([f"CASE WHEN a.{c}<>0 AND a.{c}=b.{c} THEN 1 ELSE 0 END" for c,_ in evidence_terms])
+    conn.execute(f"""
+        CREATE TABLE fuzzy_candidates AS
+        SELECT p.a,p.b,({evidence_sql}) AS evidence,({hits_sql}) AS hits,
+               CASE WHEN a.birth<>'' AND b.birth<>'' AND a.birth=b.birth THEN 1 ELSE 0 END AS exact_birth,
+               CASE WHEN a.byear>0 AND b.byear>0 THEN ABS(a.byear-b.byear) ELSE 9999 END AS year_gap
+        FROM fuzzy_candidate_pairs p
+        JOIN rows_a a ON a.row_id=p.a
+        JOIN {right} b ON b.row_id=p.b
+    """)
+    conn.execute("DROP TABLE fuzzy_candidate_pairs")
+
+    candidate_cap = int(options.fuzzy_max_candidates)
+    if candidate_cap > 0:
+        before_cap = int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidates").fetchone()[0])
+        conn.execute("DROP TABLE IF EXISTS fuzzy_candidates_limited")
+        conn.execute("""
+            CREATE TABLE fuzzy_candidates_limited AS
+            SELECT a,b,evidence,hits,exact_birth,year_gap
+            FROM (
+                SELECT fc.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY a
+                           ORDER BY exact_birth DESC,evidence DESC,hits DESC,year_gap ASC,b ASC
+                       ) AS rn
+                FROM fuzzy_candidates fc
+            )
+            WHERE rn<=?
+        """, (candidate_cap,))
+        conn.execute("DROP TABLE fuzzy_candidates")
+        conn.execute("ALTER TABLE fuzzy_candidates_limited RENAME TO fuzzy_candidates")
+        after_cap = int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidates").fetchone()[0])
+        log(
+            f"Candidate cap {candidate_cap}: retained {after_cap:,}/{before_cap:,} "
+            f"ranked candidate pair(s) for fuzzy scoring."
+        )
+
+    conn.execute("CREATE UNIQUE INDEX idx_fuzzy_candidates ON fuzzy_candidates(a,b)")
+    conn.execute("CREATE INDEX idx_fuzzy_candidates_rank ON fuzzy_candidates(a,evidence DESC,hits DESC,exact_birth DESC,year_gap,b)")
+    conn.commit()
+    count, multi, exact_birth_count = conn.execute(
+        "SELECT COUNT(*),SUM(CASE WHEN hits>=2 THEN 1 ELSE 0 END),SUM(CASE WHEN exact_birth=1 THEN 1 ELSE 0 END) FROM fuzzy_candidates"
+    ).fetchone()
+    log(
+        f"Name-core fuzzy discovery produced {int(count or 0):,} candidate pairs; "
+        f"{int(multi or 0):,} have 2+ independent strong-name hits; "
+        f"{int(exact_birth_count or 0):,} have exact birthdate. "
+        f"Birth-year gate={'NONE' if int(options.fuzzy_birth_year_window)<0 else '±'+str(int(options.fuzzy_birth_year_window))}; "
+        f"candidate cap={'NONE' if int(options.fuzzy_max_candidates)<=0 else int(options.fuzzy_max_candidates)}; "
+        f"block cap={'NONE' if int(options.fuzzy_block_limit)<=0 else int(options.fuzzy_block_limit)}."
+    )
+    # Candidate construction uses many temporary indexed driver tables. On very
+    # large files SQLite can retain those freed pages/caches on the connection,
+    # starving the subsequent scorer even though the temp tables were dropped.
+    # The clean-row filter is no longer needed after discovery; release it and
+    # explicitly shrink SQLite memory before streaming fuzzy_candidates.
+    conn.execute("DROP TABLE IF EXISTS fuzzy_clean_a")
+    conn.commit()
+    try:
+        conn.execute("PRAGMA shrink_memory")
+    except Exception:
+        pass
+    # Candidate writes are complete. Return to NORMAL locking so a fresh
+    # read-only scoring connection can stream the large candidate table without
+    # inheriting the builder connection's temp/cache state.
+    try:
+        conn.execute("PRAGMA locking_mode=NORMAL")
+        conn.commit()
+    except Exception:
+        pass
+
+def _candidate_overall_evidence(
+    row: Sequence[Any], kind: int, name_score: float,
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]],
+    birth_cache: dict[str, tuple[int, int, int] | None],
+) -> float:
+    """Use the same 75% Name / 25% DOB evidence displayed in Excel.
+
+    The user-entered threshold applies to *OverallSimilarity*, not to the
+    independent name score.  Name identity safeguards are still evaluated at
+    the fixed minimum 80% before this function is called.
+    """
+    if len(row) < 24:
+        return float(name_score)
+    _, _, an, ab, af, am, al, asu, bn, bb, bf, bm, bl, bsu, *_ = row
+    amonth, aday, ayear, bmonth, bday, byear = (str(x or '') for x in row[18:24])
+    profile = _birth_component_profile_from_components(
+        (amonth, aday, ayear), (bmonth, bday, byear)
+    )
+    dob_rate = _birth_profile_rate(profile) if profile["compared"] == 3 else None
+    if dob_rate is None:
+        # Full-DOB-only mappings must still count *conflicting* dates as 0%
+        # DOB evidence, not as missing data. A zero similarity is meaningful.
+        full_profile = _birth_component_profile(str(ab or ''), str(bb or ''))
+        if full_profile['compared'] == 3:
+            dob_rate = _birth_profile_rate(full_profile)
+
+    name_rate = float(name_score)
+    if kind in (TYPE_TRUE, TYPE_TRUE_SWAP):
+        name_rate = 100.0
+    elif any(str(x or '').strip() for x in (af, am, al, asu, bf, bm, bl, bsu)):
+        details = _name_component_profile(
+            str(af or ''), str(am or ''), str(al or ''), str(asu or ''),
+            str(bf or ''), str(bm or ''), str(bl or ''), str(bsu or ''),
+            swap=kind == TYPE_FUZZY_SWAP, feature_cache=feature_cache,
+        )
+        if details['compared']:
+            name_rate = _profile_rate(details)
+        if (asu and bsu and _canonical_suffix(str(asu)) != _canonical_suffix(str(bsu))
+                and af and al and af == bf and al == bl and am == bm):
+            name_rate = 100.0
+        elif (af and bf and af != bf and al and al == bl and am == bm
+              and asu == bsu and dob_rate is not None and dob_rate >= 100.0
+              and float(fuzz.ratio(str(af), str(bf))) >= float(MIN_DEDUP_FUZZY_THRESHOLD)):
+            name_rate = max(name_rate, round((float(fuzz.ratio(str(af), str(bf))) + 100.0) / 2.0, 1))
+    return _overall_similarity(name_rate, dob_rate)
+
+
+def _score_batch_with_caches(
+    threshold: int,
+    allow_swap: bool,
+    batch: list[tuple[Any, ...]],
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]],
+    birth_cache: dict[str, tuple[int, int, int] | None],
+    decision_cache: dict[tuple[Any, ...], tuple[bool, int, float]],
+) -> list[tuple[int, int, bool, int, float, int, int, int, int]]:
+    """Score a batch while reusing decisions for repeated identity profiles.
+
+    The cache changes computation only. Every candidate row is still emitted and
+    retains its own row IDs/evidence/hit counts.  On massive mostly-unique data
+    the cache is periodically cleared to bound RAM, with zero effect on coverage.
+    """
+    out: list[tuple[int, int, bool, int, float, int, int, int, int]] = []
+    name_floor = MIN_DEDUP_FUZZY_THRESHOLD
+    for row in batch:
+        if len(row) < 24:
+            scored = _score_fuzzy_pair_cached(row, name_floor, feature_cache, birth_cache, allow_swap)
+            overall = _candidate_overall_evidence(row, int(scored[3]), float(scored[4]), feature_cache, birth_cache)
+            if scored[2] and overall + 1e-9 < float(threshold):
+                scored = (scored[0], scored[1], False, TYPE_CLEAN, 0.0, *scored[5:])
+            out.append(scored)
+            continue
+        # Names + DOB values/components determine the fuzzy decision. Candidate
+        # evidence/hits and row IDs are metadata and are intentionally excluded.
+        key = tuple(row[2:14]) + tuple(row[18:24])
+        decision = decision_cache.get(key)
+        if decision is None:
+            scored = _score_fuzzy_pair_cached(row, name_floor, feature_cache, birth_cache, allow_swap)
+            eligible = bool(scored[2]) and (
+                _candidate_overall_evidence(row, int(scored[3]), float(scored[4]), feature_cache, birth_cache)
+                + 1e-9 >= float(threshold)
+            )
+            decision = (eligible, int(scored[3]) if eligible else TYPE_CLEAN, float(scored[4]) if eligible else 0.0)
+            decision_cache[key] = decision
+        ok, match_type, score = decision
+        out.append((
+            int(row[0]), int(row[1]), bool(ok), int(match_type), float(score),
+            int(row[14]), int(row[15]), int(row[16]), int(row[17]),
+        ))
+
+        if len(decision_cache) >= SCORE_DECISION_CACHE_MAX:
+            # Resource cache reset only; does not skip or change any candidate.
+            decision_cache.clear()
+            if len(feature_cache) > SCORE_DECISION_CACHE_MAX:
+                feature_cache.clear()
+            if len(birth_cache) > SCORE_DECISION_CACHE_MAX:
+                birth_cache.clear()
+    return out
+
+
+def _score_batch_worker(payload: tuple[int, bool, list[tuple[Any, ...]]]) -> list[tuple[int, int, bool, int, float, int, int, int, int]]:
+    """Windows-safe batch scorer with local profile/feature caches."""
+    threshold, allow_swap, batch = payload
+    feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]] = {}
+    birth_cache: dict[str, tuple[int, int, int] | None] = {}
+    decision_cache: dict[tuple[Any, ...], tuple[bool, int, float]] = {}
+    return _score_batch_with_caches(
+        threshold, allow_swap, batch, feature_cache, birth_cache, decision_cache
+    )
+
+
+def _safe_process_workers(options: ScaleOptions) -> int:
+    # MAX mode: use all requested/available CPU cores. No artificial 8-worker
+    # or RAM-derived worker cap.
+    return max(1, int(options.workers()))
+
+
+def _score_candidate_stream(conn: sqlite3.Connection, cross: bool, options: ScaleOptions, log: LogFn) -> Iterator[tuple[int, int, bool, int, float, int, int, int, int]]:
+    """Deterministic, coverage-complete fuzzy scoring with bounded parallelism.
+
+    Candidate coverage is never capped. For larger candidate sets, batches are
+    scored in multiple processes, but only a small number of batches are in
+    flight at once so RAM remains predictable. Results are yielded in original
+    SQL order for reproducibility. If a worker process fails, that exact batch
+    is scored locally instead of being dropped.
+    """
+    right = "rows_b" if cross else "rows_a"
+    sql = f"""
+        SELECT c.a,c.b,a.name,a.birth,a.first_name,a.middle_name,a.last_name,a.suffix_name,
+               b.name,b.birth,b.first_name,b.middle_name,b.last_name,b.suffix_name,
+               c.evidence,c.hits,c.exact_birth,c.year_gap,
+               a.birth_month_component,a.birth_day_component,a.birth_year_component,
+               b.birth_month_component,b.birth_day_component,b.birth_year_component
+        FROM fuzzy_candidates c
+        JOIN rows_a a ON a.row_id=c.a
+        JOIN {right} b ON b.row_id=c.b
+        ORDER BY c.a,c.evidence DESC,c.hits DESC,c.exact_birth DESC,c.year_gap,c.b
+    """
+    if options.exhaustive:
+        sql = sql[:sql.index("        ORDER BY")] + " ORDER BY c.a,c.b"
+        mask = F_DEDUP_BLOCKING_FINDING
+        na = conn.execute(f"SELECT COUNT(*) FROM rows_a WHERE (finding & {mask})=0").fetchone()[0]
+        nb = conn.execute(f"SELECT COUNT(*) FROM {right} WHERE (finding & {mask})=0").fetchone()[0]
+        total = na * nb if cross else na * (na - 1) // 2
+    else:
+        total = int(conn.execute("SELECT COUNT(*) FROM fuzzy_candidates").fetchone()[0])
+    if total <= 0:
+        return
+    cur = conn.execute(sql)
+    checked = 0
+    started = time.perf_counter()
+    last_log = started
+    workers = _safe_process_workers(options)
+    # Maximum-device mode: keep all available CPU workers active for large
+    # candidate streams. The in-flight queue remains bounded so this changes
+    # only execution scheduling, never candidate coverage or thresholds.
+    use_parallel = workers > 1 and total >= FUZZY_PROCESS_THRESHOLD
+    mode_text = f"{workers} process workers (MAXIMUM)" if use_parallel else "single-process"
+    log(
+        f"Fuzzy scoring engine: deterministic {FUZZY_SCORE_BATCH_ROWS:,}-pair batches for "
+        f"{total:,} candidates; {mode_text}; candidate coverage=ALL."
+    )
+
+    def emit(results: list[tuple[int, int, bool, int, float, int, int, int, int]]) -> Iterator[tuple[int, int, bool, int, float, int, int, int, int]]:
+        nonlocal checked, last_log
+        for result in results:
+            yield result
+        checked += len(results)
+        now = time.perf_counter()
+        if checked == total or checked % FUZZY_PROGRESS_ROWS < len(results) or now - last_log >= 5.0:
+            elapsed = max(now - started, 0.001)
+            log(f"Fuzzy scoring: {checked:,}/{total:,} pairs ({checked/elapsed:,.0f} pairs/sec).")
+            last_log = now
+
+    if not use_parallel:
+        # Reuse normalization/phonetic/profile decisions across SQL batches.
+        # The old path recreated all caches every 8,000 rows, repeatedly scoring
+        # identical name profiles in large beneficiary families.
+        feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]] = {}
+        birth_cache: dict[str, tuple[int, int, int] | None] = {}
+        decision_cache: dict[tuple[Any, ...], tuple[bool, int, float]] = {}
+        while True:
+            batch = cur.fetchmany(FUZZY_SCORE_BATCH_ROWS)
+            if not batch:
+                break
+            results = _score_batch_with_caches(
+                int(options.fuzzy_threshold), bool(options.enable_swap), batch,
+                feature_cache, birth_cache, decision_cache,
+            )
+            yield from emit(results)
+        return
+
+    # Bounded in-flight queue is a resource-control mechanism only. It never
+    # changes which candidates are evaluated. Two batches per worker generally
+    # keeps CPUs fed without ballooning parent/child memory.
+    from collections import deque
+    pending: deque[tuple[Any, list[tuple[Any, ...]]]] = deque()
+    max_inflight = max(4, workers * 3)
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        exhausted = False
+        while pending or not exhausted:
+            while not exhausted and len(pending) < max_inflight:
+                batch = cur.fetchmany(FUZZY_SCORE_BATCH_ROWS)
+                if not batch:
+                    exhausted = True
+                    break
+                future = pool.submit(
+                    _score_batch_worker,
+                    (int(options.fuzzy_threshold), bool(options.enable_swap), batch),
+                )
+                pending.append((future, batch))
+            if not pending:
+                break
+            future, batch = pending.popleft()
+            try:
+                results = future.result()
+            except Exception as exc:
+                log(f"Parallel fuzzy worker failed for one batch ({exc}); rescoring that batch locally with no data loss.")
+                results = _score_batch_worker((int(options.fuzzy_threshold), bool(options.enable_swap), batch))
+            yield from emit(results)
+
+
+def _score_candidate_stream_fresh(
+    db_path: Path | str,
+    cross: bool,
+    options: ScaleOptions,
+    log: LogFn,
+) -> Iterator[tuple[int, int, bool, int, float, int, int, int, int]]:
+    """Score from a fresh read connection after write-heavy candidate build.
+
+    Large SQLite temp/index construction can leave substantial connection-local
+    cache state even after tables are dropped. A fresh read connection prevents
+    that state from starving or stalling the scoring cursor on 250K-1M files.
+    """
+    score_conn=sqlite3.connect(str(db_path),timeout=60.0)
+    try:
+        score_conn.execute("PRAGMA query_only=ON")
+        score_conn.execute("PRAGMA temp_store=FILE")
+        score_conn.execute("PRAGMA cache_size=-262144")
+        try:
+            score_conn.execute("PRAGMA mmap_size=1073741824")
+        except Exception:
+            pass
+        results = _score_candidate_stream(score_conn,cross,options,log)
+        if options.exhaustive:
+            from engine.exhaustive import capture
+            yield from capture(results, db_path)
+        else:
+            yield from results
+    finally:
+        score_conn.close()
+
+
+def _prepare_fuzzy_clean_filter(
+    conn: sqlite3.Connection,
+    dtype: np.ndarray,
+    log: LogFn,
+    group: np.ndarray | None = None,
+    score: np.ndarray | None = None,
+) -> tuple[np.ndarray, bool]:
+    """Install a compact fuzzy-review row set.
+
+    Within File A, keep every CLEAN row plus one preferred representative from
+    each confirmed exact/swap group. This allows fuzzy evidence to bridge two
+    previously separate families without rescoring every member of each exact
+    group. Existing DedupType values are preserved.
+
+    Cross Match keeps the older CLEAN-only filter because File B remains the
+    external reference.
+    """
+    clean_rows = np.flatnonzero(np.isin(dtype, [TYPE_CLEAN, TYPE_FINDING]))
+
+    representative_rows = np.empty(0, dtype=np.int64)
+    if group is not None and len(group) and np.any(group > 0):
+        score_values = score if score is not None else np.zeros(len(dtype), dtype=np.float32)
+        source_by_group = _preferred_source_row_by_group(group, dtype, score_values)
+        representative_rows = source_by_group[source_by_group >= 0].astype(np.int64, copy=False)
+
+    if representative_rows.size:
+        selected_rows = np.unique(np.concatenate([clean_rows.astype(np.int64, copy=False), representative_rows]))
+        use_filter = True
+    else:
+        selected_rows = clean_rows.astype(np.int64, copy=False)
+        if len(selected_rows) == 0:
+            return selected_rows, False
+        use_filter = len(selected_rows) < int(len(dtype) * 0.80)
+
+    if not use_filter:
+        return selected_rows, False
+
+    conn.execute("DROP TABLE IF EXISTS fuzzy_clean_a")
+    conn.execute("CREATE TEMP TABLE fuzzy_clean_a(row_id INTEGER PRIMARY KEY) WITHOUT ROWID")
+    for start in range(0, len(selected_rows), 50_000):
+        batch = selected_rows[start:start + 50_000]
+        conn.executemany("INSERT INTO fuzzy_clean_a VALUES (?)", ((int(x),) for x in batch))
+
+    if representative_rows.size:
+        log(
+            f"Fuzzy family bridge: {len(clean_rows):,} clean rows + "
+            f"{len(representative_rows):,} confirmed-group representatives retained."
+        )
+    else:
+        log(f"Fuzzy scale filter: {len(clean_rows):,} clean rows retained.")
+    return selected_rows, True
+
+
+def _apply_within_fuzzy(
+    conn: sqlite3.Connection,
+    stage: StagedFile,
+    dtype: np.memmap,
+    group: np.memmap,
+    score: np.memmap,
+    matched: np.memmap,
+    finding_code: np.memmap,
+    options: ScaleOptions,
+    log: LogFn,
+) -> None:
+    fuzzy_rows, use_clean_filter = _prepare_fuzzy_clean_filter(conn, dtype, log, group=group, score=score)
+    if len(fuzzy_rows) == 0 and not options.exhaustive:
+        log("Fuzzy matching skipped: no eligible clean rows or group representatives.")
+        return
+    _build_candidate_table(conn, False, options, stage.rows, log, use_clean_filter)
+    n = stage.rows
+
+    # Work in RAM for per-row decisions, but spool accepted edges to SQLite so
+    # Self Dedup can perform the same ambiguity/tie analysis as Cross Match
+    # without holding millions of candidate edges in Python memory.
+    dtype_ram = np.asarray(dtype).copy()
+    group_ram = np.asarray(group).copy()
+    score_ram = np.asarray(score).copy()
+    matched_ram = np.asarray(matched).copy()
+
+    best_type = np.zeros(n, dtype=np.uint8)
+    best_score = np.zeros(n, dtype=np.float32)
+    best_partner = np.full(n, -1, dtype=np.int64)
+    best_exact_birth = np.zeros(n, dtype=np.uint8)
+    best_evidence = np.zeros(n, dtype=np.uint16)
+    best_hits = np.zeros(n, dtype=np.uint8)
+    best_year_gap = np.full(n, 1_000_000, dtype=np.int32)
+    second_score = np.full(n, -1.0, dtype=np.float32)
+    second_partner = np.full(n, -1, dtype=np.int64)
+    second_exact_birth = np.zeros(n, dtype=np.uint8)
+    second_evidence = np.zeros(n, dtype=np.uint16)
+    second_hits = np.zeros(n, dtype=np.uint8)
+    second_year_gap = np.full(n, 1_000_000, dtype=np.int32)
+    ambiguous_score = np.zeros(n, dtype=np.float32)
+
+    conn.execute("DROP TABLE IF EXISTS fuzzy_accepted_edges")
+    conn.execute("""
+        CREATE TEMP TABLE fuzzy_accepted_edges(
+            a INTEGER NOT NULL,
+            b INTEGER NOT NULL,
+            match_type INTEGER NOT NULL,
+            match_score REAL NOT NULL,
+            exact_birth INTEGER NOT NULL,
+            year_gap INTEGER NOT NULL,
+            PRIMARY KEY(a,b)
+        ) WITHOUT ROWID
+    """)
+
+    def consider(
+        row: int, partner: int, t: int, s: float, evidence: int, hits: int,
+        exact_birth: int, year_gap: int,
+    ) -> None:
+        row = int(row); partner = int(partner)
+        value = float(s); ev = int(evidence); hit = int(hits); exact = int(exact_birth); gap = int(year_gap)
+        # Ranking favors corroboration/completeness before tiny score gains:
+        # exact DOB > candidate evidence > independent hits > name score > year gap.
+        # This prevents a missing-Middle/missing-DOB 100% pair from outranking a
+        # complete 98% pair supported by the same DOB and richer name evidence.
+        better = (
+            exact > int(best_exact_birth[row])
+            or (exact == int(best_exact_birth[row]) and ev > int(best_evidence[row]))
+            or (exact == int(best_exact_birth[row]) and ev == int(best_evidence[row]) and hit > int(best_hits[row]))
+            or (exact == int(best_exact_birth[row]) and ev == int(best_evidence[row]) and hit == int(best_hits[row]) and value > float(best_score[row]))
+            or (exact == int(best_exact_birth[row]) and ev == int(best_evidence[row]) and hit == int(best_hits[row]) and value == float(best_score[row]) and gap < int(best_year_gap[row]))
+            or (
+                exact == int(best_exact_birth[row])
+                and ev == int(best_evidence[row])
+                and hit == int(best_hits[row])
+                and value == float(best_score[row])
+                and gap == int(best_year_gap[row])
+                and (int(best_partner[row]) < 0 or partner < int(best_partner[row]))
+            )
+        )
+        if better:
+            if int(best_partner[row]) >= 0 and int(best_partner[row]) != partner:
+                second_score[row] = best_score[row]
+                second_partner[row] = best_partner[row]
+                second_exact_birth[row] = best_exact_birth[row]
+                second_evidence[row] = best_evidence[row]
+                second_hits[row] = best_hits[row]
+                second_year_gap[row] = best_year_gap[row]
+            best_score[row] = value
+            best_type[row] = int(t)
+            best_partner[row] = partner
+            best_exact_birth[row] = exact
+            best_evidence[row] = ev
+            best_hits[row] = hit
+            best_year_gap[row] = gap
+        elif partner != int(best_partner[row]):
+            second_better = (
+                exact > int(second_exact_birth[row])
+                or (exact == int(second_exact_birth[row]) and ev > int(second_evidence[row]))
+                or (exact == int(second_exact_birth[row]) and ev == int(second_evidence[row]) and hit > int(second_hits[row]))
+                or (exact == int(second_exact_birth[row]) and ev == int(second_evidence[row]) and hit == int(second_hits[row]) and value > float(second_score[row]))
+                or (exact == int(second_exact_birth[row]) and ev == int(second_evidence[row]) and hit == int(second_hits[row]) and value == float(second_score[row]) and gap < int(second_year_gap[row]))
+            )
+            if second_better:
+                second_score[row] = value
+                second_partner[row] = partner
+                second_exact_birth[row] = exact
+                second_evidence[row] = ev
+                second_hits[row] = hit
+                second_year_gap[row] = gap
+
+    accepted = 0
+    family_bridges = 0
+    edge_buffer: list[tuple[int, int, int, float, int, int]] = []
+    for a, b, ok, t, s, evidence, hits, exact_birth, year_gap in _score_candidate_stream_fresh(stage.db_path, False, options, log):
+        a = int(a); b = int(b)
+        if not ok:
+            continue
+        if t == TYPE_FINDING:
+            ambiguous_score[a] = max(float(ambiguous_score[a]), float(s))
+            ambiguous_score[b] = max(float(ambiguous_score[b]), float(s))
+            continue
+
+        a_confirmed = dtype_ram[a] in (TYPE_TRUE, TYPE_TRUE_SWAP, TYPE_FUZZY, TYPE_FUZZY_SWAP)
+        b_confirmed = dtype_ram[b] in (TYPE_TRUE, TYPE_TRUE_SWAP, TYPE_FUZZY, TYPE_FUZZY_SWAP)
+        different_existing_families = (
+            a_confirmed and b_confirmed and group_ram[a] > 0 and group_ram[b] > 0 and group_ram[a] != group_ram[b]
+        )
+        if different_existing_families and float(s) < float(options.fuzzy_threshold):
+            continue
+        if different_existing_families:
+            family_bridges += 1
+
+        accepted += 1
+        consider(a, b, int(t), float(s), int(evidence), int(hits), int(exact_birth), int(year_gap))
+        consider(b, a, int(t), float(s), int(evidence), int(hits), int(exact_birth), int(year_gap))
+        edge_buffer.append((a, b, int(t), float(s), int(exact_birth), int(year_gap)))
+        if len(edge_buffer) >= 10_000:
+            conn.executemany(
+                "INSERT OR REPLACE INTO fuzzy_accepted_edges VALUES (?,?,?,?,?,?)",
+                edge_buffer,
+            )
+            edge_buffer.clear()
+    if edge_buffer:
+        conn.executemany(
+            "INSERT OR REPLACE INTO fuzzy_accepted_edges VALUES (?,?,?,?,?,?)",
+            edge_buffer,
+        )
+        edge_buffer.clear()
+    conn.commit()
+
+    # Candidate-construction ambiguity (block cap, etc.) remains Review only
+    # when there is no accepted name edge for the row.
+    pre_review_ids = np.fromiter(
+        (int(r[0]) for r in conn.execute("SELECT a FROM fuzzy_pre_review")),
+        dtype=np.int64,
+    )
+    if pre_review_ids.size:
+        unresolved_pre = pre_review_ids[
+            (best_score[pre_review_ids] <= 0)
+            & np.isin(dtype_ram[pre_review_ids], [TYPE_CLEAN, TYPE_FINDING])
+        ]
+        ambiguous_score[unresolved_pre] = np.maximum(
+            ambiguous_score[unresolved_pre], float(options.fuzzy_threshold)
+        )
+
+    # Self Dedup ambiguity protection: if two near-equal best partners exist and
+    # DOB does not clearly distinguish them, do not allow that row to bridge two
+    # otherwise separate identities. This is especially important for a missing
+    # Middle Name record among several complete-middle variants.
+    near_tie = (
+        (second_partner >= 0)
+        & (best_partner >= 0)
+        & ((best_score - second_score) <= float(AMBIGUOUS_MATCH_MARGIN))
+    )
+    corroboration_not_decisive = (
+        (best_exact_birth == second_exact_birth)
+        & (np.abs(best_evidence.astype(np.int32) - second_evidence.astype(np.int32)) <= 1)
+        & (np.abs(best_hits.astype(np.int16) - second_hits.astype(np.int16)) <= 1)
+        & (np.abs(best_year_gap - second_year_gap) <= 2)
+    )
+    tied_rows = np.flatnonzero(near_tie & corroboration_not_decisive)
+
+    unresolved_generated = (
+        (ambiguous_score > 0)
+        & (best_score <= 0)
+        & np.isin(dtype_ram, [TYPE_CLEAN, TYPE_FINDING])
+    )
+    generated_rows = np.flatnonzero(unresolved_generated)
+    ambiguous_rows = np.unique(np.concatenate([tied_rows, generated_rows]))
+    ambiguous_mask = np.zeros(n, dtype=bool)
+    if ambiguous_rows.size:
+        ambiguous_mask[ambiguous_rows] = True
+        dtype_ram[ambiguous_rows] = TYPE_FINDING
+        finding_code[ambiguous_rows] = (
+            np.asarray(finding_code[ambiguous_rows], dtype=np.uint16)
+            | np.uint16(F_AMBIGUOUS_MATCH)
+        )
+        score_ram[ambiguous_rows] = np.maximum(
+            score_ram[ambiguous_rows],
+            np.maximum(best_score[ambiguous_rows], ambiguous_score[ambiguous_rows]),
+        )
+        matched_ram[ambiguous_rows] = best_partner[ambiguous_rows]
+
+    # Build duplicate families only from unambiguous accepted edges.
+    parent = np.arange(n, dtype=np.int64)
+    rank = np.zeros(n, dtype=np.uint8)
+    active_node = np.zeros(n, dtype=bool)
+    active_best_score = np.zeros(n, dtype=np.float32)
+    active_best_type = np.zeros(n, dtype=np.uint8)
+    active_best_partner = np.full(n, -1, dtype=np.int64)
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = int(parent[x])
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+
+    for a, b, t, s, exact_birth, year_gap in conn.execute(
+        "SELECT a,b,match_type,match_score,exact_birth,year_gap FROM fuzzy_accepted_edges ORDER BY a,b"
+    ):
+        a = int(a); b = int(b); t = int(t); s = float(s)
+        if ambiguous_mask[a] or ambiguous_mask[b]:
+            continue
+        union(a, b)
+        active_node[a] = True
+        active_node[b] = True
+        for row, partner in ((a, b), (b, a)):
+            if s > float(active_best_score[row]) or (
+                s == float(active_best_score[row]) and t == TYPE_FUZZY_SWAP
+            ):
+                active_best_score[row] = s
+                active_best_type[row] = t
+                active_best_partner[row] = partner
+
+    # If a row had accepted evidence only through an ambiguous partner, it is
+    # also unresolved. Keep it visible in Review rather than creating a one-row
+    # duplicate family.
+    orphan_rows = np.flatnonzero(
+        (best_score > 0)
+        & (~ambiguous_mask)
+        & (~active_node)
+        & np.isin(dtype_ram, [TYPE_CLEAN, TYPE_FINDING])
+    )
+    if orphan_rows.size:
+        ambiguous_mask[orphan_rows] = True
+        dtype_ram[orphan_rows] = TYPE_FINDING
+        finding_code[orphan_rows] = (
+            np.asarray(finding_code[orphan_rows], dtype=np.uint16)
+            | np.uint16(F_AMBIGUOUS_MATCH)
+        )
+        score_ram[orphan_rows] = np.maximum(score_ram[orphan_rows], best_score[orphan_rows])
+        matched_ram[orphan_rows] = best_partner[orphan_rows]
+
+    log(
+        f"Fuzzy matching accepted {accepted:,} candidate edge(s), including {family_bridges:,} strict family bridges; "
+        f"{len(tied_rows):,} near-tie row(s) and {len(generated_rows) + len(orphan_rows):,} unresolved row(s) retained for Review."
+    )
+
+    nodes = np.flatnonzero(active_node)
+    if len(nodes) == 0:
+        dtype[:] = dtype_ram
+        score[:] = score_ram
+        matched[:] = matched_ram
+        finding_code.flush()
+        conn.execute("DROP TABLE IF EXISTS fuzzy_accepted_edges")
+        return
+
+    # Components may touch existing exact/swap groups. Merge deterministically.
+    components: dict[int, list[int]] = {}
+    for row in nodes:
+        components.setdefault(find(int(row)), []).append(int(row))
+    next_group = int(group_ram.max()) + 1
+    merge_group: dict[int, int] = {}
+    for members in components.values():
+        existing = sorted({int(group_ram[x]) for x in members if group_ram[x] > 0})
+        if existing:
+            target = existing[0]
+            for old in existing[1:]:
+                merge_group[old] = target
+        else:
+            target = next_group
+            next_group += 1
+        for row in members:
+            group_ram[row] = target
+            if dtype_ram[row] in (TYPE_CLEAN, TYPE_FINDING):
+                dtype_ram[row] = active_best_type[row] or TYPE_FUZZY
+                score_ram[row] = active_best_score[row]
+            if dtype_ram[row] in (TYPE_FUZZY, TYPE_FUZZY_SWAP) and active_best_partner[row] >= 0:
+                matched_ram[row] = active_best_partner[row]
+
+    if merge_group:
+        max_group = int(group_ram.max())
+        remap = np.arange(max_group + 1, dtype=np.int64)
+        for old, new in merge_group.items():
+            if 0 <= old <= max_group:
+                remap[old] = new
+        for _ in range(8):
+            updated = remap[remap]
+            if np.array_equal(updated, remap):
+                break
+            remap = updated
+        group_ram[:] = remap[group_ram]
+
+    conn.execute("DROP TABLE IF EXISTS fuzzy_accepted_edges")
+    dtype[:] = dtype_ram
+    group[:] = group_ram
+    score[:] = score_ram
+    matched[:] = matched_ram
+    finding_code.flush()
+
+
+def _strict_revalidate_within_groups(
+    conn: sqlite3.Connection,
+    dtype: np.memmap,
+    group: np.memmap,
+    score: np.memmap,
+    finding_code: np.ndarray,
+    threshold: int,
+    log: LogFn,
+) -> None:
+    """Make every fuzzy member pass the threshold against its displayed reference.
+
+    The fuzzy graph can contain valid A-B and B-C edges even when A-C is below
+    the user's threshold. That transitive chain is useful for recall, but it is
+    confusing in a reference-first Excel group because C can appear under A with
+    a displayed rate below the selected threshold.
+
+    Strict mode keeps only fuzzy members that independently meet the user's
+    threshold against the actual group reference. Therefore an 80% run can never
+    export a fuzzy MATCH row below 80% against the reference shown above it.
+    """
+    floor = max(MIN_DEDUP_FUZZY_THRESHOLD, min(100, int(threshold)))
+    if floor <= 0 or len(dtype) == 0:
+        return
+
+    dtype_ram = np.asarray(dtype).copy()
+    group_ram = np.asarray(group).copy()
+    score_ram = np.asarray(score).copy()
+    finding_values = np.asarray(finding_code)
+
+    fuzzy_mask = np.isin(dtype_ram, [TYPE_FUZZY, TYPE_FUZZY_SWAP]) & (group_ram > 0)
+    fuzzy_rows = np.flatnonzero(fuzzy_mask)
+    if fuzzy_rows.size == 0:
+        return
+
+    source_by_group = _preferred_source_row_by_group(group_ram, dtype_ram, score_ram)
+    rejected: list[int] = []
+    rescored = 0
+
+    # Bounded detail batches keep this safe for large datasets.
+    batch_size = 20_000
+    for start in range(0, len(fuzzy_rows), batch_size):
+        rows = fuzzy_rows[start:start + batch_size]
+        source_ids = source_by_group[group_ram[rows]]
+        needed = np.unique(np.concatenate([rows.astype(np.int64), source_ids.astype(np.int64)]))
+        details = _fetch_row_details(conn, 'rows_a', needed.tolist())
+
+        for rid, sid in zip(rows.tolist(), source_ids.tolist()):
+            rid = int(rid); sid = int(sid)
+            if sid < 0 or rid == sid:
+                continue
+            current = details.get(rid)
+            reference = details.get(sid)
+            if current is None or reference is None:
+                rejected.append(rid)
+                continue
+
+            _an, _ab, af, am, al, asu = current
+            _bn, _bb, bf, bm, bl, bsu = reference
+            swap = int(dtype_ram[rid]) == TYPE_FUZZY_SWAP
+
+            # Structured files use the strict First/Middle/Last/Suffix profile.
+            # Full Name-only files must NOT be forced through an empty structured
+            # profile. That old behavior accepted a valid fuzzy edge first, then
+            # incorrectly demoted it to Review during final group verification.
+            structured = bool(af or am or al or asu or bf or bm or bl or bsu)
+            if structured:
+                profile = _name_component_profile(
+                    af, am, al, asu, bf, bm, bl, bsu,
+                    swap=swap, feature_cache={},
+                )
+                rate = _profile_rate(profile)
+                passed = _profile_accepts(profile, floor) and rate >= float(floor)
+            else:
+                feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]] = {}
+                aphon, acompact, asorted, atokens = _fuzzy_features(_an, feature_cache)
+                bphon, bcompact, bsorted, btokens = _fuzzy_features(_bn, feature_cache)
+
+                normal_rate = float(max(
+                    fuzz.ratio(_an, _bn),
+                    fuzz.QRatio(_an, _bn),
+                    fuzz.ratio(str(_an).replace(" ", ""), str(_bn).replace(" ", "")),
+                    fuzz.ratio(aphon, bphon),
+                    fuzz.QRatio(aphon, bphon),
+                    fuzz.ratio(acompact, bcompact),
+                ))
+                swap_rate = float(max(
+                    fuzz.token_sort_ratio(_an, _bn),
+                    fuzz.token_sort_ratio(aphon, bphon),
+                    fuzz.ratio("".join(sorted(str(_an).split())), "".join(sorted(str(_bn).split()))),
+                    fuzz.ratio(asorted, bsorted),
+                    _unordered_token_alignment_score(atokens, btokens),
+                ))
+                rate = swap_rate if swap else normal_rate
+
+                if not swap:
+                    birth_profile = _birth_component_profile(str(_ab or ""), str(_bb or ""))
+                    birth_rate = _birth_profile_rate(birth_profile)
+                    support_decision, support_rate = _full_name_support_decision(
+                        str(_an or ""), str(_bn or ""), floor,
+                        birth_rate, int(birth_profile.get("compared", 0)),
+                        feature_cache,
+                    )
+                    if support_decision == "auto":
+                        rate = max(float(rate), float(support_rate))
+                        passed = rate >= float(floor)
+                    elif support_decision in {"review", "reject"}:
+                        passed = False
+                    else:
+                        passed = rate >= float(floor)
+                else:
+                    passed = rate >= float(floor)
+
+            if not passed:
+                rejected.append(rid)
+                continue
+            score_ram[rid] = round(float(rate), 1)
+            rescored += 1
+
+    if rejected:
+        rejected_arr = np.unique(np.asarray(rejected, dtype=np.int64))
+        # v6.27: these rows already passed at least one direct >= floor fuzzy
+        # name edge. Keep them in DUPLICATE RECORDS rather than moving name-only
+        # evidence to RECORDS FOR REVIEW merely because the family display
+        # reference is a different transitive member. Preserve the accepted edge
+        # score/group; the export still shows the configured floor.
+        pass
+
+    # A duplicate family must still contain at least two records after strict
+    # filtering. Pure-fuzzy sources left alone are restored to Clean/Review.
+    active = np.isin(dtype_ram, [TYPE_TRUE, TYPE_TRUE_SWAP, TYPE_FUZZY, TYPE_FUZZY_SWAP]) & (group_ram > 0)
+    if active.any():
+        counts = np.bincount(group_ram[active].astype(np.int64), minlength=int(group_ram.max()) + 1)
+        singleton_mask = active & (counts[group_ram] < 2)
+        singleton_rows = np.flatnonzero(singleton_mask)
+        if singleton_rows.size:
+            # No accepted fuzzy member is removed in v6.27, so this normally
+            # remains empty. If encountered, retain the existing duplicate state.
+            pass
+        else:
+            singleton_rows = np.empty(0, dtype=np.int64)
+    else:
+        singleton_rows = np.empty(0, dtype=np.int64)
+
+    dtype[:] = dtype_ram
+    group[:] = group_ram
+    score[:] = score_ram
+    log(
+        f'Strict fuzzy threshold: {rescored:,} fuzzy row(s) verified directly against '
+        f'their displayed reference at >= {floor}%; {len(set(rejected)):,} chained row(s) '
+        f'below the displayed family reference retained in Duplicate Records; {len(singleton_rows):,} orphan fuzzy row(s) retained.'
+    )
+
+
+def _apply_cross_fuzzy(
+    conn: sqlite3.Connection,
+    a: StagedFile,
+    b: StagedFile,
+    dtype: np.memmap,
+    matched: np.memmap,
+    score: np.memmap,
+    finding_code: np.memmap,
+    options: ScaleOptions,
+    log: LogFn,
+) -> None:
+    clean_rows, use_clean_filter = _prepare_fuzzy_clean_filter(conn, dtype, log)
+    if len(clean_rows) == 0 and not options.exhaustive:
+        log("Cross fuzzy review skipped: every eligible File A row already matched TRUE or TRUE_SWAP.")
+        return
+    _build_candidate_table(conn, True, options, a.rows, log, use_clean_filter)
+    dtype_ram = np.asarray(dtype).copy()
+    matched_ram = np.asarray(matched).copy()
+    score_ram = np.asarray(score).copy()
+    best_score = np.zeros(a.rows, dtype=np.float32)
+    best_type = np.zeros(a.rows, dtype=np.uint8)
+    best_b = np.full(a.rows, -1, dtype=np.int64)
+    best_evidence = np.zeros(a.rows, dtype=np.uint8)
+    best_hits = np.zeros(a.rows, dtype=np.uint8)
+    best_exact_birth = np.zeros(a.rows, dtype=np.uint8)
+    second_score = np.full(a.rows, -1.0, dtype=np.float32)
+    second_b = np.full(a.rows, -1, dtype=np.int64)
+    second_exact_birth = np.zeros(a.rows, dtype=np.uint8)
+    second_year_gap = np.full(a.rows, 1_000_000, dtype=np.int32)
+    ambiguous_candidate_score = np.zeros(a.rows, dtype=np.float32)
+    ambiguous_candidate_b = np.full(a.rows, -1, dtype=np.int64)
+    # year_gap uses 9999 when either birth year is unavailable. int8 overflowed
+    # and crashed Cross fuzzy runs with missing/far birthdates.
+    best_year_gap = np.full(a.rows, 1_000_000, dtype=np.int32)
+    accepted = 0
+    for arow, brow, ok, t, s, evidence, hits, exact_birth, year_gap in _score_candidate_stream_fresh(a.db_path, True, options, log):
+        if not ok or dtype_ram[arow] not in (TYPE_CLEAN, TYPE_FINDING):
+            continue
+        if t == TYPE_FINDING:
+            if s > ambiguous_candidate_score[arow]:
+                ambiguous_candidate_score[arow] = s
+                ambiguous_candidate_b[arow] = brow
+            continue
+        accepted += 1
+        better = (
+            s > best_score[arow]
+            or (s == best_score[arow] and evidence > best_evidence[arow])
+            or (s == best_score[arow] and evidence == best_evidence[arow] and hits > best_hits[arow])
+            or (s == best_score[arow] and evidence == best_evidence[arow] and hits == best_hits[arow] and exact_birth > best_exact_birth[arow])
+            or (s == best_score[arow] and evidence == best_evidence[arow] and hits == best_hits[arow]
+                and exact_birth == best_exact_birth[arow] and year_gap < best_year_gap[arow])
+            or (s == best_score[arow] and evidence == best_evidence[arow] and hits == best_hits[arow]
+                and exact_birth == best_exact_birth[arow] and year_gap == best_year_gap[arow]
+                and (best_b[arow] < 0 or brow < best_b[arow]))
+        )
+        if better:
+            if best_b[arow] >= 0:
+                second_score[arow] = best_score[arow]
+                second_b[arow] = best_b[arow]
+                second_exact_birth[arow] = best_exact_birth[arow]
+                second_year_gap[arow] = best_year_gap[arow]
+            best_score[arow] = s; best_type[arow] = t; best_b[arow] = brow
+            best_evidence[arow] = evidence; best_hits[arow] = hits; best_exact_birth[arow] = exact_birth; best_year_gap[arow] = year_gap
+        elif s > second_score[arow]:
+            second_score[arow] = s
+            second_b[arow] = brow
+            second_exact_birth[arow] = exact_birth
+            second_year_gap[arow] = year_gap
+    # Add mathematically pruned incomplete-name candidates to the manual-review
+    # pool. Keep one deterministic B reference for the Excel review display.
+    for pa, pb in conn.execute("SELECT a,b FROM fuzzy_pre_review"):
+        pa = int(pa); pb = int(pb)
+        if 0 <= pa < a.rows and best_b[pa] < 0 and ambiguous_candidate_b[pa] < 0:
+            ambiguous_candidate_b[pa] = pb
+            ambiguous_candidate_score[pa] = float(options.fuzzy_threshold)
+
+    rows = np.flatnonzero(best_b >= 0)
+    near_tie = (second_b >= 0) & (best_b >= 0) & ((best_score - second_score) <= float(AMBIGUOUS_MATCH_MARGIN))
+    dob_not_decisive = (best_exact_birth == second_exact_birth) & (np.abs(best_year_gap - second_year_gap) <= 2)
+    tied_rows = np.flatnonzero(near_tie & dob_not_decisive)
+    auto_mask = np.ones(a.rows, dtype=bool)
+    auto_mask[tied_rows] = False
+    auto_rows = rows[auto_mask[rows]]
+    dtype_ram[auto_rows] = best_type[auto_rows]
+    score_ram[auto_rows] = best_score[auto_rows]
+    matched_ram[auto_rows] = best_b[auto_rows]
+
+    unresolved = (best_b < 0) & (ambiguous_candidate_b >= 0)
+    review_rows = np.unique(np.concatenate([tied_rows, np.flatnonzero(unresolved)]))
+    if review_rows.size:
+        dtype_ram[review_rows] = TYPE_FINDING
+        finding_code[review_rows] = np.asarray(finding_code[review_rows], dtype=np.uint16) | np.uint16(F_AMBIGUOUS_MATCH)
+        for rid in review_rows.tolist():
+            if best_b[rid] >= 0:
+                matched_ram[rid] = best_b[rid]; score_ram[rid] = best_score[rid]
+            else:
+                matched_ram[rid] = ambiguous_candidate_b[rid]; score_ram[rid] = ambiguous_candidate_score[rid]
+
+    log(
+        f"Cross fuzzy review automatically matched {len(auto_rows):,} File A rows from {accepted:,} accepted comparisons; "
+        f"{len(review_rows):,} ambiguous row(s) retained for manual review instead of arbitrary tie-breaking."
+    )
+    dtype[:] = dtype_ram
+    score[:] = score_ram
+    matched[:] = matched_ram
+    finding_code.flush()
+
+
+def _preferred_source_row_by_group(group: np.ndarray, dtype: np.ndarray, score: np.ndarray) -> np.ndarray:
+    """Choose one clear source row per duplicate family.
+
+    Preference is deterministic:
+      TRUE_DUPLICATE -> TRUE_SWAP_DUPLICATE -> FUZZY_DUPLICATE -> FUZZY_SWAP_DUPLICATE,
+      then higher match score, then the earliest File A row.
+
+    This affects presentation/DedupRole only. It does not change duplicate decisions.
+    """
+    max_group = int(group.max()) if len(group) else 0
+    source = np.full(max_group + 1, -1, dtype=np.int64)
+    idx = np.flatnonzero(group > 0)
+    if len(idx) == 0:
+        return source
+
+    priority_map = np.full(256, 99, dtype=np.int16)
+    priority_map[TYPE_TRUE] = 0
+    priority_map[TYPE_TRUE_SWAP] = 1
+    priority_map[TYPE_FUZZY] = 2
+    priority_map[TYPE_FUZZY_SWAP] = 3
+
+    priorities = priority_map[np.asarray(dtype[idx], dtype=np.uint8)]
+    scores = np.asarray(score[idx], dtype=np.float32)
+    # Stable lexicographic order: group, type priority, score descending, row id.
+    order = np.lexsort((idx, -scores, priorities, group[idx]))
+    sorted_idx = idx[order]
+    sorted_groups = group[sorted_idx]
+    first = np.ones(len(sorted_idx), dtype=bool)
+    first[1:] = sorted_groups[1:] != sorted_groups[:-1]
+    source[sorted_groups[first]] = sorted_idx[first]
+    return source
+
+
+def _fetch_row_details(conn: sqlite3.Connection, table: str, ids: Sequence[int]) -> dict[int, tuple[str, str, str, str, str, str]]:
+    unique = sorted(set(int(x) for x in ids if int(x) >= 0))
+    result: dict[int, tuple[str, str, str, str, str, str]] = {}
+    if table not in {"rows_a", "rows_b"}:
+        raise ValueError("Invalid detail table")
+    for start in range(0, len(unique), 800):
+        batch = unique[start:start + 800]
+        placeholders = ",".join("?" for _ in batch)
+        sql = f"SELECT row_id,name,birth,first_name,middle_name,last_name,suffix_name FROM {table} WHERE row_id IN ({placeholders})"
+        for row_id, name, birth, first, middle, last, suffix in conn.execute(sql, batch):
+            result[int(row_id)] = tuple(str(x or "") for x in (name, birth, first, middle, last, suffix))
+    return result
+
+
+def _fetch_b_details(conn: sqlite3.Connection, ids: Sequence[int]) -> dict[int, tuple[str, str, str, str, str, str]]:
+    return _fetch_row_details(conn, "rows_b", ids)
+
+
+def _fetch_birth_components(
+    conn: sqlite3.Connection,
+    table: str,
+    ids: Sequence[int],
+) -> dict[int, tuple[str, str, str]]:
+    unique = sorted(set(int(x) for x in ids if int(x) >= 0))
+    result: dict[int, tuple[str, str, str]] = {}
+    if table not in {"rows_a", "rows_b"}:
+        raise ValueError("Invalid detail table")
+    for start in range(0, len(unique), 800):
+        batch = unique[start:start + 800]
+        placeholders = ",".join("?" for _ in batch)
+        sql = (
+            f"SELECT row_id,birth_month_component,birth_day_component,birth_year_component "
+            f"FROM {table} WHERE row_id IN ({placeholders})"
+        )
+        for row_id, month, day, year in conn.execute(sql, batch):
+            result[int(row_id)] = tuple(str(x or "") for x in (month, day, year))
+    return result
+
+
+def _safe_excel_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    text = str(value)
+    # Excel cell text limit is 32,767 characters.
+    return text if len(text) <= 32767 else text[:32764] + "..."
+
+
+def _display_text_series(series: pd.Series) -> pd.Series:
+    """Return readable original text without treating null tokens as real values."""
+    out = series.astype("string").fillna("").str.replace(r"\s+", " ", regex=True).str.strip()
+    missing = out.str.casefold().isin(MISSING_TOKENS)
+    return out.mask(missing, "").fillna("").astype(str)
+
+
+def _duplicate_record_name(chunk: pd.DataFrame, mapping: ColumnMapping) -> pd.Series:
+    """Build one visible name column for the front of DUPLICATE RECORDS.
+
+    The original Full Name is preferred because it preserves the user's spelling
+    and capitalization. Blank Full Name cells fall back to First + Middle + Last
+    + Suffix in natural reading order.
+    """
+    index = chunk.index
+    full = _display_text_series(_series(chunk, mapping.full_name)) if mapping.full_name else pd.Series("", index=index, dtype=object)
+    pieces: list[pd.Series] = []
+    for header in (mapping.first, mapping.middle, mapping.last, mapping.suffix):
+        if header and header in chunk.columns:
+            pieces.append(_display_text_series(chunk[header]))
+    if pieces:
+        structured = pieces[0].astype("string").fillna("")
+        for part in pieces[1:]:
+            structured = structured.str.cat(part.astype("string").fillna(""), sep=" ")
+        structured = structured.str.replace(r"\s+", " ", regex=True).str.strip().fillna("").astype(str)
+    else:
+        structured = pd.Series("", index=index, dtype=object)
+    return full.where(full.astype(str).str.strip().ne(""), structured).fillna("").astype(str)
+
+
+def _duplicate_record_birthdate(chunk: pd.DataFrame, mapping: ColumnMapping) -> pd.Series:
+    """Build one readable MM/DD/YYYY birthdate column for duplicate review."""
+    index = chunk.index
+    full = pd.Series("", index=index, dtype=object)
+    if mapping.birthdate and mapping.birthdate in chunk.columns:
+        normalized, _invalid, _ambiguous, _future, _under_age, _too_old = normalize_birthdate_series(
+            chunk[mapping.birthdate], min_age=0, max_age=0
+        )
+        full = normalized.astype("string").fillna("").str.replace("-", "/", regex=False).astype(str)
+
+    split = pd.Series("", index=index, dtype=object)
+    if (
+        mapping.birth_month and mapping.birth_month in chunk.columns
+        and mapping.birth_day and mapping.birth_day in chunk.columns
+        and mapping.birth_year and mapping.birth_year in chunk.columns
+    ):
+        month = normalize_month_series(chunk[mapping.birth_month])
+        day = normalize_day_series(chunk[mapping.birth_day])
+        year = normalize_year_series(chunk[mapping.birth_year])
+        valid = month.ne("") & day.ne("") & year.ne("")
+        split.loc[valid] = month.loc[valid] + "/" + day.loc[valid] + "/" + year.loc[valid]
+
+    result = full.where(full.astype(str).str.strip().ne(""), split).fillna("").astype(str)
+    if mapping.birthdate and mapping.birthdate in chunk.columns:
+        raw = _display_text_series(chunk[mapping.birthdate])
+        result = result.where(result.astype(str).str.strip().ne(""), raw)
+    return result.fillna("").astype(str)
+
+
+def _finding_reason_counts(finding_values: np.ndarray, min_age: int = 18, max_age: int = 125) -> dict[str, int]:
+    """Count user-readable Review reasons from compact finding bit masks."""
+    values = np.asarray(finding_values, dtype=np.uint16)
+    values = values[values != 0]
+    if values.size == 0:
+        return {}
+    unique, counts = np.unique(values, return_counts=True)
+    combined: dict[str, int] = {}
+    for code, count in zip(unique.tolist(), counts.tolist()):
+        reason = _finding_reason(int(code), min_age=min_age, max_age=max_age)
+        combined[reason] = combined.get(reason, 0) + int(count)
+    return dict(sorted(combined.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _exact_reason_text(mapping: ColumnMapping, swap: bool = False) -> str:
+    parts: list[str] = []
+    if mapping.has_name(): parts.append("Name")
+    if mapping.has_birth(): parts.append("Birthdate")
+    if not parts and mapping.has_exact(): parts.append("selected exact data")
+    identity = " + ".join(parts) if parts else "selected identity"
+    if swap:
+        return f"Duplicate: exact {identity} match after the name order was swapped."
+    return f"Duplicate: exact {identity} match."
+
+
+def _reason_cell(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text else "missing"
+
+
+def _detail_tuple_from_row(row: Any, mapping: ColumnMapping) -> tuple[str, str, str, str, str, str]:
+    def clean(header: str) -> str:
+        if not header: return ""
+        return normalize_name_series(pd.Series([_row_cell(row, header)])).iloc[0]
+    first = clean(mapping.first); middle = clean(mapping.middle); last = clean(mapping.last); suffix = clean(mapping.suffix)
+    pieces = [x for x in (first, middle, last, suffix) if x]
+    name = " ".join(pieces)
+    birth = ""
+    if mapping.birthdate:
+        normalized, _invalid, _ambiguous, _future, _under, _old = normalize_birthdate_series(
+            pd.Series([_row_cell(row, mapping.birthdate)]), min_age=0, max_age=0
+        )
+        birth = str(normalized.iloc[0] or "")
+    elif mapping.birth_month and mapping.birth_day and mapping.birth_year:
+        month = normalize_month_series(pd.Series([_row_cell(row, mapping.birth_month)])).iloc[0]
+        day = normalize_day_series(pd.Series([_row_cell(row, mapping.birth_day)])).iloc[0]
+        year = normalize_year_series(pd.Series([_row_cell(row, mapping.birth_year)])).iloc[0]
+        if month and day and year:
+            birth = f"{month}-{day}-{year}"
+    return name, birth, first, middle, last, suffix
+
+
+def _component_status(label: str, a: str, b: str, *, middle: bool = False, suffix: bool = False) -> str:
+    a = str(a or ""); b = str(b or "")
+    if not a and not b: return ""
+    if not a or not b:
+        return f"{label}: {_reason_cell(a)} vs {_reason_cell(b)} (optional missing value ignored)" if label in {"Middle", "Suffix"} else f"{label}: {_reason_cell(a)} vs {_reason_cell(b)}"
+    if suffix:
+        same = _canonical_suffix(a) == _canonical_suffix(b)
+        return f"Suffix: {a} vs {b} ({'same' if same else 'different'})"
+    score = _close_component_score(a, b, {}, initial_aware=middle)
+    exact_text = normalize_name_series(pd.Series([a])).iloc[0] == normalize_name_series(pd.Series([b])).iloc[0]
+    if exact_text: state = "same"
+    elif score >= 80: state = "similar"
+    else: state = "different"
+    return f"{label}: {a} vs {b} ({state}, {score:.0f}%)"
+
+
+def _birth_status(a: str, b: str) -> str:
+    a = str(a or "").strip(); b = str(b or "").strip()
+    if not a or a == "missing" or not b or b == "missing":
+        return f"Birthdate: {_reason_cell(a)} vs {_reason_cell(b)}"
+    if a == b:
+        return f"Birthdate: {a} vs {b} (same)"
+    return f"Birthdate: {a} vs {b} (different; fuzzy matching is name-based)"
+
+
+def _display_name_birth(detail: tuple[str, str, str, str, str, str]) -> tuple[str, str]:
+    name, birth, first, middle, last, suffix = detail
+    shown_name = " ".join(x for x in (first, middle, last, suffix) if x) or name or "missing"
+    shown_birth = str(birth or "missing").replace("-", "/")
+    return shown_name.upper(), shown_birth
+
+
+def _easy_duplicate_reason(
+    dtype_value: int,
+    score_value: float,
+    current: tuple[str, str, str, str, str, str],
+    reference: tuple[str, str, str, str, str, str],
+    *,
+    context: str,
+    reference_row: int | None = None,
+) -> str:
+    """Compact duplicate/cross reason with both Name + Birthdate visible."""
+    a_name, a_birth = _display_name_birth(current)
+    b_name, b_birth = _display_name_birth(reference)
+    row_no = (int(reference_row) + 1) if reference_row is not None else "?"
+
+    if dtype_value == TYPE_TRUE:
+        match_label = "TRUE 100%"
+        note = "Exact selected identity match"
+    elif dtype_value == TYPE_TRUE_SWAP:
+        match_label = "TRUE_SWAP 100%"
+        note = "Exact match; name order swapped"
+    elif dtype_value == TYPE_FUZZY_SWAP:
+        match_label = f"FUZZY_SWAP {float(score_value):.1f}%"
+        note = "Similar name; order swapped"
+    else:
+        match_label = f"FUZZY {float(score_value):.1f}%"
+        note = "Similar name"
+
+    if a_birth == "missing" or b_birth == "missing":
+        dob_note = "DOB missing on one side"
+    elif a_birth == b_birth:
+        dob_note = "DOB same"
+    else:
+        dob_note = "DOB different"
+
+    if context == "cross":
+        return (
+            "Cross Match |\n"
+            f"File A: {a_name} | DOB: {a_birth} |\n"
+            f"File B: {b_name} | DOB: {b_birth} | Row: {row_no} |\n"
+            f"{match_label} | {note}; {dob_note}."
+        )
+
+    return (
+        f"Duplicate | This: {a_name} | DOB: {a_birth} | "
+        f"Ref row {row_no}: {b_name} | DOB: {b_birth} | "
+        f"{match_label} | {note}; {dob_note}."
+    )
+
+
+def _simple_match_reason(
+    dtype_value: int,
+    score_value: float,
+    current: tuple[str, str, str, str, str, str],
+    reference: tuple[str, str, str, str, str, str],
+    *,
+    current_birth_components: tuple[str, str, str] | None = None,
+    reference_birth_components: tuple[str, str, str] | None = None,
+    precomputed_name_profile: dict[str, Any] | None = None,
+    precomputed_birth_profile: dict[str, Any] | None = None,
+) -> str:
+    """Short transparent Name + date-aware DOB + Overall evidence reason."""
+    _an, ab, af, am, al, asu = current
+    _bn, bb, bf, bm, bl, bsu = reference
+
+    swap = dtype_value in (TYPE_TRUE_SWAP, TYPE_FUZZY_SWAP)
+    name_profile = precomputed_name_profile or _name_component_profile(
+        af, am, al, asu, bf, bm, bl, bsu,
+        swap=swap, feature_cache={},
+    )
+
+    if dtype_value == TYPE_TRUE:
+        label = "Exact match"
+        name_rate = 100.0
+    elif dtype_value == TYPE_TRUE_SWAP:
+        label = "Exact swapped-name match"
+        name_rate = 100.0
+    elif dtype_value == TYPE_FUZZY_SWAP:
+        label = "Similar swapped name"
+        name_rate = _profile_rate(name_profile) if name_profile["compared"] else float(score_value)
+    else:
+        label = "Similar name"
+        name_rate = _profile_rate(name_profile) if name_profile["compared"] else float(score_value)
+
+    if (asu and bsu and _canonical_suffix(asu) != _canonical_suffix(bsu)
+            and af and al and af == bf and al == bl and am == bm):
+        name_rate = 100.0
+        label += " (Jr./Sr. suffix conflict — verify identity)"
+    elif dtype_value == TYPE_FUZZY and af and al and af == bf and al == bl and am == bm and asu == bsu:
+        label = "Exact name (verify DOB)"
+
+    # Full Name-only data may contain a suffix but no mapped Suffix column.
+    # Show this identity warning even when the normalized core name matches.
+    if not (af or al or bf or bl):
+        _at, _asu = _full_name_core_tokens(_an)
+        _bt, _bsu = _full_name_core_tokens(_bn)
+        if _asu and _bsu and _asu != _bsu and _at == _bt:
+            label += " (Jr./Sr. suffix conflict — verify identity)"
+
+    cur_birth = current_birth_components or _birth_components_from_full_birth(ab)
+    ref_birth = reference_birth_components or _birth_components_from_full_birth(bb)
+    if all(cur_birth) and all(ref_birth) and cur_birth != ref_birth:
+        label += " (Different DOB — manual verification)"
+    elif not all(cur_birth) or not all(ref_birth):
+        label += " (Missing/incomplete DOB — manual verification)"
+    # Percentages are already separate user-facing export columns. Reasons
+    # explain missing/conflicting evidence, not repeated numerical data.
+    notes = [label]
+    if bool(am) != bool(bm):
+        notes.append("Missing middle name — For Manual Verification")
+    elif am and bm and am != bm:
+        notes.append("Different middle names — Verify")
+    if bool(asu) != bool(bsu):
+        notes.append("Missing suffix — For Manual Verification")
+    elif asu and bsu and _canonical_suffix(asu) != _canonical_suffix(bsu):
+        notes.append("Different suffix — Verify identity")
+    if (not all(cur_birth) or not all(ref_birth)) and not any('DOB' in note for note in notes):
+        notes.append("Missing/partial DOB — For Manual Verification")
+    return " | ".join(notes)
+
+
+
+
+
+def _simple_cross_match_conflict_reason(
+    dtype_value: int,
+    current: tuple[str, str, str, str, str, str],
+    reference: tuple[str, str, str, str, str, str],
+    *,
+    current_birth_components: tuple[str, str, str] | None = None,
+    reference_birth_components: tuple[str, str, str] | None = None,
+) -> str:
+    """Human-friendly Cross Match reason.
+
+    Keep the percentages in their dedicated MatchPercentage,
+    BirthdateSimilarity and OverallSimilarity columns. ConflictReason should
+    explain *why* the row matched in plain language instead of repeating every
+    component score.
+    """
+    _an, ab, af, am, al, asu = current
+    _bn, bb, bf, bm, bl, bsu = reference
+
+    swap = dtype_value in (TYPE_TRUE_SWAP, TYPE_FUZZY_SWAP)
+    exact = dtype_value in (TYPE_TRUE, TYPE_TRUE_SWAP)
+
+    if exact and not swap:
+        name_note = "Same name"
+    elif exact and swap:
+        name_note = "Same name; First/Last order swapped"
+    else:
+        notes: list[str] = []
+        if swap:
+            notes.append("First/Last name order swapped")
+
+        # Detail tuples are already normalized, so text inequality gives a
+        # clearer explanation than the fuzzy score. A phonetic scorer may rate
+        # SANTOS/SANTOZ as 100%, but a person still benefits from seeing that
+        # the middle-name spelling differs.
+        first_a = str(af or "").strip()
+        first_b = str((bl if swap else bf) or "").strip()
+        last_a = str(al or "").strip()
+        last_b = str((bf if swap else bl) or "").strip()
+        if first_a and first_b and first_a != first_b:
+            notes.append("First name slightly different")
+        if last_a and last_b and last_a != last_b:
+            notes.append("Last name slightly different")
+
+        am_clean = str(am or "").strip()
+        bm_clean = str(bm or "").strip()
+        if bool(am_clean) != bool(bm_clean):
+            notes.append("Middle name missing in one record")
+        elif am_clean and bm_clean and am_clean != bm_clean:
+            notes.append("Middle name slightly different")
+
+        asu_clean = str(asu or "").strip()
+        bsu_clean = str(bsu or "").strip()
+        if bool(asu_clean) != bool(bsu_clean):
+            notes.append("Suffix missing in one record")
+        elif asu_clean and bsu_clean and _canonical_suffix(asu_clean) != _canonical_suffix(bsu_clean):
+            notes.append("Jr./Sr. or suffix conflict — manual identity verification")
+
+        if not (af or al or bf or bl):
+            at, asuf = _full_name_core_tokens(_an)
+            bt, bsuf = _full_name_core_tokens(_bn)
+            if asuf and bsuf and asuf != bsuf and at == bt:
+                notes.append("Jr./Sr. suffix conflict — verify identity")
+        if not notes and ((af and al and af == bf and al == bl and am == bm and asu == bsu)
+                          or (not (af or al or bf or bl) and _an and _an == _bn)):
+            name_note = "Exact name"
+        else:
+            name_note = "; ".join(notes) if notes else "Names are similar"
+
+    cur_birth = current_birth_components or _birth_components_from_full_birth(ab)
+    ref_birth = reference_birth_components or _birth_components_from_full_birth(bb)
+    birth_profile = _birth_component_profile_from_components(cur_birth, ref_birth)
+    compared = int(birth_profile.get("compared", 0))
+    birth_rate = _birth_profile_rate(birth_profile)
+    birth_scores = [
+        score for _label, score in birth_profile.get("components", [])
+        if score is not None
+    ]
+
+    if compared == 0 or birth_rate is None:
+        birth_note = "Missing DOB — For Manual Verification"
+    elif compared == 3 and all(float(score) >= 99.999 for score in birth_scores):
+        birth_note = "Same birthdate"
+    elif compared == 3:
+        birth_note = "DOB conflict — For Manual Verification"
+    elif all(float(score) >= 99.999 for score in birth_scores):
+        birth_note = "Partial DOB — For Manual Verification"
+    elif float(birth_rate) <= 0.001:
+        birth_note = "Different birthdate"
+    else:
+        birth_note = "Partial DOB — For Manual Verification"
+
+    if exact and not swap:
+        if birth_note == "Same birthdate":
+            return "Exact match | Same name and birthdate"
+        return f"Exact match | Same name | {birth_note}"
+
+    if exact and swap:
+        return f"Exact swapped-name match | {name_note} | {birth_note}"
+
+    if dtype_value == TYPE_FUZZY_SWAP:
+        return f"Similar swapped name | {name_note} | {birth_note}"
+
+    return f"Similar name | {name_note} | {birth_note}"
+
+
+def _reference_reason(source_name: str, row_number: int | None = None) -> str:
+    source_name = str(source_name or "reference").strip()
+    if row_number is None or int(row_number) <= 0:
+        return f"Reference record | {source_name}"
+    return f"Reference record | {source_name} row {int(row_number)}"
+
+
+def _project_cross_reference_row(
+    row: Any,
+    a: StagedFile,
+    b: StagedFile,
+    pair_map: dict[str, str],
+) -> list[Any]:
+    """Project one File B source row into File A's visible output columns.
+
+    This lets Cross Match use the same group layout as within-File-A:
+    reference row first, matched rows underneath.
+    """
+    values: list[Any] = []
+
+    # Performance hardening: the common structured-header case already has a
+    # direct A->B pair for First/Middle/Last/Birthdate. v6.28 still called
+    # _detail_tuple_from_row() for EVERY File B reference row, which creates
+    # several one-row Pandas Series and date parsers per group. At tens of
+    # thousands of groups this dominated runtime after fuzzy scoring finished.
+    # Only build normalized fallback Name/Birth text when an unmapped File A
+    # Full Name or Birthdate column actually requires it.
+    need_name_fallback = bool(
+        a.mapping.full_name
+        and not str(pair_map.get(a.mapping.full_name, "") or "").strip()
+    )
+    need_birth_fallback = bool(
+        a.mapping.birthdate
+        and not str(pair_map.get(a.mapping.birthdate, "") or "").strip()
+    )
+    b_name = "MISSING"
+    b_birth = "missing"
+    if need_name_fallback or need_birth_fallback:
+        b_name_detail = _detail_tuple_from_row(row, b.mapping)
+        b_name, b_birth = _display_name_birth(b_name_detail)
+
+    for header_a in a.headers:
+        header_b = str(pair_map.get(header_a, "") or "")
+        if header_b:
+            values.append(_row_cell(row, header_b))
+            continue
+
+        # Helpful fallback when File A has a Full Name/Birthdate column but
+        # File B stores the identity as split fields.
+        if need_name_fallback and header_a == a.mapping.full_name and b_name != "MISSING":
+            values.append(b_name)
+            continue
+        if need_birth_fallback and header_a == a.mapping.birthdate and b_birth != "missing":
+            values.append(b_birth)
+            continue
+        values.append("")
+    return values
+
+
+def _is_output_lock_error(exc: BaseException) -> bool:
+    """Return True for file-lock/access-denied errors seen during final save."""
+    if isinstance(exc, PermissionError):
+        return True
+    winerror = getattr(exc, "winerror", None)
+    if winerror in {5, 32, 33}:
+        return True
+    errno_value = getattr(exc, "errno", None)
+    return errno_value in {13, 16, 26}
+
+
+def _unique_locked_output_path(output_path: Path) -> Path:
+    """Return a timestamped sibling path that does not already exist."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = output_path.with_name(f"{output_path.stem}_{stamp}{output_path.suffix}")
+    counter = 2
+    while candidate.exists():
+        candidate = output_path.with_name(
+            f"{output_path.stem}_{stamp}_{counter}{output_path.suffix}"
+        )
+        counter += 1
+    return candidate
+
+
+def _finalize_excel_output(
+    partial_path: Path,
+    output_path: Path,
+    log: LogFn,
+    *,
+    retries: int = 4,
+    retry_delay: float = 0.65,
+) -> tuple[Path, bool]:
+    """Finalize the workbook safely even when the requested XLSX is locked.
+
+    Returns (actual_saved_path, used_alternate_filename).
+    """
+    last_lock_error: BaseException | None = None
+    attempts = max(1, int(retries))
+
+    for attempt in range(attempts):
+        try:
+            os.replace(partial_path, output_path)
+            return output_path, False
+        except OSError as exc:
+            if not _is_output_lock_error(exc):
+                raise
+            last_lock_error = exc
+            if attempt + 1 < attempts:
+                log(
+                    f"Output workbook is locked/open. Retrying final save "
+                    f"({attempt + 1}/{attempts - 1})..."
+                )
+                time.sleep(max(0.05, float(retry_delay)) * (attempt + 1))
+
+    alternate = _unique_locked_output_path(output_path)
+    try:
+        os.replace(partial_path, alternate)
+        log(
+            "Requested Excel output is locked/open. "
+            f"Saved safely to alternate file: {alternate}"
+        )
+        return alternate, True
+    except OSError as fallback_exc:
+        raise PermissionError(
+            "Excel export finished, but Windows blocked the final save. "
+            f"The completed temporary workbook is still available at:\n{partial_path}\n\n"
+            f"Requested output:\n{output_path}\n\n"
+            "Close Excel, File Explorer Preview, or sync software that may be using the file, "
+            "then rename the temporary workbook manually. "
+            f"Original lock error: {last_lock_error or fallback_exc}"
+        ) from fallback_exc
+
+
+def export_results(
+    a: StagedFile,
+    b: StagedFile | None,
+    class_paths: dict[str, Path],
+    options: ScaleOptions,
+    output_folder: Path,
+    run_name: str,
+    log: LogFn,
+) -> dict[str, Any]:
+    """Stream all classified rows to XLSX or a direct CSV ZIP.
+
+    Both sinks share the source traversal, duplicate grouping, and no-loss
+    counters. CSV output does not first write/read an XLSX workbook.
+    """
+    direct_csv = str(options.export_format).casefold() == "csv_zip"
+    if direct_csv:
+        from engine.csv_workbook import CsvWorkbook
+    else:
+        try:
+            import xlsxwriter
+        except Exception as exc:
+            raise RuntimeError("Excel export requires XlsxWriter. Install it with: pip install xlsxwriter") from exc
+
+    output_folder.mkdir(parents=True, exist_ok=True)
+    output_path = Path(options.output_file).expanduser() if options.output_file else output_folder / f"{run_name}.xlsx"
+    if not output_path.is_absolute():
+        output_path = (output_folder / output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_extension = ".zip" if direct_csv else ".xlsx"
+    if output_path.suffix.casefold() != output_extension:
+        output_path = output_path.with_suffix(output_extension)
+
+    # Never overwrite a source workbook. The export is atomic, but replacing the
+    # user's input file with a result workbook would still be destructive.
+    source_paths = [a.source_plan.path]
+    if b is not None:
+        source_paths.append(b.source_plan.path)
+    output_resolved = output_path.resolve()
+    for source_path in source_paths:
+        try:
+            if output_resolved == Path(source_path).resolve():
+                raise ValueError(
+                    "Output workbook cannot be the same file as File A or File B. "
+                    "Choose a different output filename."
+                )
+        except FileNotFoundError:
+            pass
+
+    # Write to a sibling partial file and replace the final workbook only after
+    # XlsxWriter closes successfully. A failed 1M-row export no longer destroys
+    # the user's previous valid result workbook.
+    # Unique partial name prevents a stale/locked partial workbook from an
+    # earlier run from blocking a new export.
+    partial_path = output_path.with_name(
+        f"{output_path.stem}.partial.{os.getpid()}.{time.time_ns()}{output_extension}"
+    )
+
+    advanced_conn = sqlite3.connect(options.enrichment_path) if options.enrichment_path else None
+    type_arr = np.memmap(class_paths["type"], dtype=np.uint8, mode="r", shape=(a.rows,))
+    group_arr = np.memmap(class_paths["group"], dtype=np.int64, mode="r", shape=(a.rows,))
+    score_arr = np.memmap(class_paths["score"], dtype=np.float32, mode="r", shape=(a.rows,))
+    matched_arr = np.memmap(class_paths["matched"], dtype=np.int64, mode="r", shape=(a.rows,))
+    finding_arr = a.memmap("finding", np.uint16, "r")
+    duplicate_mask_all = np.isin(type_arr, [TYPE_TRUE, TYPE_TRUE_SWAP, TYPE_FUZZY, TYPE_FUZZY_SWAP])
+    source_by_group = _preferred_source_row_by_group(group_arr, type_arr, score_arr)
+    max_group_id = int(group_arr.max()) if len(group_arr) else 0
+
+    # Within File A, the reference is one existing File A row in the family.
+    # Cross Match uses File B as the real reference/master record, so export one
+    # File B source row before the matched File A rows in every group.
+    source_b_by_group = np.full(max_group_id + 1, -1, dtype=np.int64)
+    if b is not None and max_group_id > 0:
+        duplicate_a_ids = np.flatnonzero(duplicate_mask_all)
+        for rid in duplicate_a_ids:
+            gid = int(group_arr[rid])
+            bid = int(matched_arr[rid])
+            if gid <= 0 or bid < 0:
+                continue
+            old_bid = int(source_b_by_group[gid])
+            if old_bid < 0 or bid < old_bid:
+                source_b_by_group[gid] = bid
+
+    cross_reference_rows = int(np.count_nonzero(source_b_by_group >= 0)) if b is not None else 0
+    duplicate_sheet_total_rows = int(np.count_nonzero(duplicate_mask_all)) + cross_reference_rows
+
+    duplicate_groups = np.asarray(group_arr[duplicate_mask_all], dtype=np.int64)
+    group_sizes = np.bincount(duplicate_groups, minlength=max_group_id + 1) if duplicate_groups.size else np.zeros(max_group_id + 1, dtype=np.int64)
+    from services.duplicate_group_styles import (
+        GROUP_BANDS, MATCH_HIGHLIGHTS, GROUP_BORDER,
+        group_band, highlight_kind, group_id_from_cell,
+    )
+    group_type_counts = {
+        TYPE_TRUE: np.bincount(np.asarray(group_arr[type_arr == TYPE_TRUE], dtype=np.int64), minlength=max_group_id + 1),
+        TYPE_FUZZY: np.bincount(np.asarray(group_arr[type_arr == TYPE_FUZZY], dtype=np.int64), minlength=max_group_id + 1),
+        TYPE_TRUE_SWAP: np.bincount(np.asarray(group_arr[type_arr == TYPE_TRUE_SWAP], dtype=np.int64), minlength=max_group_id + 1),
+        TYPE_FUZZY_SWAP: np.bincount(np.asarray(group_arr[type_arr == TYPE_FUZZY_SWAP], dtype=np.int64), minlength=max_group_id + 1),
+    }
+    counts = {
+        "Validated Records": int(np.count_nonzero(type_arr == TYPE_CLEAN)),
+        "Duplicate Records": int(np.count_nonzero(duplicate_mask_all)),
+        "Records for Review": int(np.count_nonzero(type_arr == TYPE_FINDING)),
+        "TRUE_DUPLICATE": int(np.count_nonzero(type_arr == TYPE_TRUE)),
+        "TRUE_SWAP_DUPLICATE": int(np.count_nonzero(type_arr == TYPE_TRUE_SWAP)),
+        "FUZZY_DUPLICATE": int(np.count_nonzero(type_arr == TYPE_FUZZY)),
+        "FUZZY_SWAP_DUPLICATE": int(np.count_nonzero(type_arr == TYPE_FUZZY_SWAP)),
+        "File A Rows": int(a.rows),
+        "File B Rows": int(b.rows if b else 0),
+    }
+    integrity = counts["Validated Records"] + counts["Duplicate Records"] + counts["Records for Review"] == a.rows
+    review_reason_counts = _finding_reason_counts(np.asarray(finding_arr), min_age=options.min_age, max_age=options.max_age)
+    if counts["Records for Review"] == counts["File A Rows"] and counts["File A Rows"] > 0:
+        top_text = "; ".join(f"{reason}: {count:,}" for reason, count in list(review_reason_counts.items())[:5])
+        log("WARNING: Every File A row was routed to Records for Review. " + (f"Top reasons: {top_text}" if top_text else "Check Header Mapping and Review checkboxes."))
+
+    if direct_csv:
+        workbook = CsvWorkbook(str(partial_path))
+        log("Direct CSV ZIP output: streaming result sheets without first building Excel XML.")
+    else:
+        workbook = xlsxwriter.Workbook(
+            str(partial_path),
+            {
+                "constant_memory": True,
+                "strings_to_formulas": False,
+                "strings_to_urls": False,
+                "strings_to_numbers": False,
+            },
+        )
+    # XlsxWriter otherwise uses the classic ZIP container and can fail once a
+    # very wide/large 500K-1M export grows beyond 4 GiB. Zip64 changes only the
+    # archive container; it does not change Excel values or matching results.
+    workbook.use_zip64()
+    large_export_mode = int(a.rows) >= LARGE_EXPORT_ROW_THRESHOLD
+    if large_export_mode:
+        log(
+            f"Large export mode: {a.rows:,} File A rows. "
+            + ("Zip64 + direct disk-backed CSV sheets; no result-row truncation."
+               if direct_csv else "Zip64 + constant-memory XLSX streaming; no result-row truncation.")
+        )
+    workbook.set_properties({
+        "title": APP_TITLE,
+        "subject": "De-duplication result",
+        "author": "Local De-duplication",
+        "comments": "Generated by the 500K-1M optimized deduplication engine.",
+    })
+    header_fmt = workbook.add_format({
+        "bold": True, "font_color": "#FFFFFF", "bg_color": "#1F4E78",
+        "border": 1, "border_color": "#8EA9C1", "align": "center", "valign": "vcenter",
+    })
+    title_fmt = workbook.add_format({"bold": True, "font_size": 14, "font_color": "#FFFFFF", "bg_color": "#17365D"})
+    section_fmt = workbook.add_format({"bold": True, "font_color": "#FFFFFF", "bg_color": "#305496"})
+    text_fmt = workbook.add_format({"valign": "top"})
+    wrap_fmt = workbook.add_format({"text_wrap": True, "valign": "top"})
+    duplicate_reason_fmt = workbook.add_format({
+        "text_wrap": True,
+        "valign": "top",
+        "bold": True,
+        "font_size": 11,
+    })
+    integer_fmt = workbook.add_format({"num_format": "#,##0"})
+    ok_fmt = workbook.add_format({"bold": True, "font_color": "#006100", "bg_color": "#C6EFCE"})
+    bad_fmt = workbook.add_format({"bold": True, "font_color": "#9C0006", "bg_color": "#FFC7CE"})
+
+    # Alternate white/gray by displayed duplicate group, NOT by group ID.
+    # Fuzzy/swapped match rows have their own highlight; the DedupGroup cell
+    # retains the group's neutral stripe. Fixed formats use constant memory.
+    row_formats = {}
+    group_id_formats = {}
+    marker_formats = {}
+    score_formats = {}
+    reason_formats = {}
+    for band_name, base_palette in GROUP_BANDS.items():
+        for highlight_name in (None, *MATCH_HIGHLIGHTS):
+            palette = MATCH_HIGHLIGHTS[highlight_name] if highlight_name else base_palette
+            for first_row in (False, True):
+                key = (band_name, highlight_name, first_row)
+                border = {"top": 2, "top_color": GROUP_BORDER} if first_row else {}
+                row_base = {"bg_color": palette['fill'], "valign": "vcenter", **border}
+                row_formats[key] = workbook.add_format(row_base)
+                group_id_formats[key] = workbook.add_format({
+                    **row_base, "bg_color": base_palette['strong'],
+                    "font_color": base_palette['font'], "bold": True,
+                })
+                marker_formats[key] = workbook.add_format({
+                    **row_base, "bg_color": palette['strong'],
+                    "font_color": palette['font'], "bold": True,
+                })
+                score_formats[key] = workbook.add_format({
+                    **row_base, "font_color": palette['font'], "bold": True,
+                })
+                reason_formats[key] = workbook.add_format({
+                    **row_base, "text_wrap": True,
+                })
+
+    # User-facing SUMMARY: only the six counts needed for a report.
+    # Total File represents all uploaded records (A + B). The three outcome
+    # counts classify File A only: File B is a reference in Cross Match mode.
+    # Retain internal integrity checks and detailed counts in job metadata.
+    summary_ws = workbook.add_worksheet("SUMMARY")
+    summary_ws.hide_gridlines(2)
+    summary_ws.set_column("A:A", 30)
+    summary_ws.set_column("B:B", 20)
+    summary_ws.write_row(0, 0, ["Item", "Count"], header_fmt)
+    summary_rows: list[tuple[str, int]] = [
+        ("File A", counts["File A Rows"]),
+        ("File B", counts["File B Rows"]),
+        ("Total File", counts["File A Rows"] + counts["File B Rows"]),
+        ("Validated Records", counts["Validated Records"]),
+        ("Duplicate Records", counts["Duplicate Records"]),
+        ("Records for Review", counts["Records for Review"]),
+    ]
+    for row_index, (label, value) in enumerate(summary_rows, start=1):
+        summary_ws.write(row_index, 0, label, text_fmt)
+        summary_ws.write_number(row_index, 1, int(value), integer_fmt)
+    summary_ws.freeze_panes(1, 0)
+
+    # v6.32.34: Do not add PROCESSING SUMMARY or RUN_INFO tabs to downloads.
+    # All classification integrity checks, job status and counts above remain
+    # available to the web application, and the SUMMARY sheet stays intact.
+
+    # Preserve the uploaded table exactly in its original column order.
+    # Cross Match adds one audit column so every exported row clearly shows
+    # whether it came from File A or File B and which source file supplied it.
+    # Within-file dedup keeps the previous layout unchanged.
+    def _source_file_label(side: str, staged: StagedFile) -> str:
+        override = options.source_a_label if side == "File A" else options.source_b_label
+        if str(override or "").strip():
+            return f"{side} | {str(override).strip()}"
+        filename = Path(staged.source_plan.path).name
+        sheet = str(staged.source_plan.sheet or "").strip()
+        label = f"{side} | {filename}"
+        if sheet and sheet.upper() != "CSV":
+            label += f" | Sheet: {sheet}"
+        return label
+
+    source_a_label = _source_file_label("File A", a)
+    source_b_label = _source_file_label("File B", b) if b is not None else ""
+
+    source_columns = ["SourceFile"] if b is not None else []
+    advanced_columns = ["Match Type", "Name Similarity %", "DOB Similarity %", "Overall Evidence %",
+        "Death Status A", "Death Status B", "Review Flag", "Condition Triggered", "Source Row Reference"] if advanced_conn else []
+    b_columns = [f"File B | {header}" for header in b.headers] if b is not None else []
+    output_columns = list(a.headers) + source_columns + [
+        "DedupGroup", "DedupRole", "DedupType", "MatchPercentage",
+        "BirthdateSimilarity", "OverallSimilarity", "ConflictReason"
+    ] + advanced_columns + b_columns
+    duplicate_output_columns = list(output_columns)
+    # Export exactly four computed columns; preserve raw input columns.
+    # Internal metadata stays available for grouping/coloring, but not as
+    # user-visible worksheet/CSV headers.
+    b_unique_headers = [h for h in b.headers if h not in a.headers] if b is not None else []
+    visible_export_headers = list(a.headers) + b_unique_headers + [
+        "Match Type", "Match Percentage", "Overall Similarity", "Reason",
+    ]
+    a_source_indices = list(range(len(a.headers)))
+    b_source_indices = [output_columns.index(f"File B | {h}") for h in b_unique_headers]
+    type_index = output_columns.index("DedupType")
+    role_index = output_columns.index("DedupRole")
+    name_score_index = output_columns.index("MatchPercentage")
+    overall_index = output_columns.index("OverallSimilarity")
+    reason_index = output_columns.index("ConflictReason")
+
+    def visible_values(row: list[Any] | tuple[Any, ...]) -> list[Any]:
+        result = [row[i] for i in a_source_indices]
+        # B source fields are populated on File B reference rows only;
+        # do not repeat reference data in a File A beneficiary row.
+        role = str(row[role_index] or "")
+        result += [row[i] if role == "REFERENCE (FILE B)" else "" for i in b_source_indices]
+        marker = role if role.startswith("REFERENCE (FILE ") else row[type_index]
+        result += [marker, row[name_score_index], row[overall_index], row[reason_index]]
+        return result
+
+    duplicate_group_col = duplicate_output_columns.index("DedupGroup")
+    duplicate_role_col = duplicate_output_columns.index("DedupRole")
+    duplicate_type_col = duplicate_output_columns.index("DedupType")
+
+    def _excel_col_letter(index: int) -> str:
+        value = int(index) + 1
+        chars: list[str] = []
+        while value:
+            value, rem = divmod(value - 1, 26)
+            chars.append(chr(65 + rem))
+        return "".join(reversed(chars))
+
+    duplicate_role_col_letter = _excel_col_letter(duplicate_role_col)
+    duplicate_type_col_letter = _excel_col_letter(duplicate_type_col)
+    excel_max_data_rows = EXCEL_MAX_DATA_ROWS
+
+    class SheetWriter:
+        def __init__(self, base_name: str):
+            self.base_name = base_name
+            self.part = 0
+            self.ws = None
+            self.row = 0
+            self.total = 0
+            self._new_sheet()
+
+        def _new_sheet(self) -> None:
+            self.part += 1
+            name = self.base_name if self.part == 1 else f"{self.base_name[:25]} {self.part}"
+            self.ws = workbook.add_worksheet(name[:31])
+            self.ws.hide_gridlines(2)
+            self.ws.freeze_panes(1, 0)
+            self.ws.write_row(0, 0, visible_export_headers, header_fmt)
+            self.ws.set_row(0, 24)
+            for col_idx, header in enumerate(visible_export_headers):
+                width = 18
+                if header in {"DedupGroup", "DedupRole", "DedupType", "MatchPercentage", "BirthdateSimilarity", "OverallSimilarity"}:
+                    width = 20
+                elif header == "SourceFile":
+                    width = 36
+                elif header == "ConflictReason":
+                    width = 80
+                else:
+                    width = max(10, min(45, len(str(header)) + 3))
+                self.ws.set_column(col_idx, col_idx, width)
+            self.row = 1
+
+        def write_dataframe_rows(self, frame: pd.DataFrame) -> None:
+            if frame.empty:
+                return
+            # XlsxWriter constant_memory mode requires row-major writes.
+            for values in frame.itertuples(index=False, name=None):
+                if self.row > excel_max_data_rows:
+                    self._new_sheet()
+                safe = (["" if v is None else str(v) for v in values]
+                        if direct_csv else [_safe_excel_value(v) for v in values])
+                self.ws.write_row(self.row, 0, visible_values(safe))
+                self.row += 1
+                self.total += 1
+
+
+    class GroupedDuplicateWriter:
+        """Write duplicate families consecutively with source first and outline controls."""
+
+        def __init__(self):
+            self.part = 0
+            self.ws = None
+            self.row = 0
+            self.total = 0
+            self.last_group = -1
+            self.group_ordinal = 0
+            self._new_sheet()
+
+        def _finish_sheet(self) -> None:
+            if self.ws is not None and self.row > 1:
+                last_row = self.row - 1
+                last_col = len(visible_export_headers) - 1
+
+                # Direct cell styles avoid expensive Excel conditional-format
+                # formulas and work even on 500K-1M record outputs.
+                self.ws.autofilter(0, 0, last_row, last_col)
+
+        def _new_sheet(self) -> None:
+            self._finish_sheet()
+            self.part += 1
+            name = "DUPLICATE RECORDS" if self.part == 1 else f"DUPLICATE RECORDS {self.part}"
+            self.ws = workbook.add_worksheet(name[:31])
+            self.ws.hide_gridlines(2)
+            # Keep the uploaded column order untouched. Freeze only the header
+            # row because the location of the person's name differs by source.
+            self.ws.freeze_panes(1, 0)
+            self.ws.write_row(0, 0, visible_export_headers, header_fmt)
+            self.ws.set_row(0, 24)
+            for col_idx, header in enumerate(visible_export_headers):
+                if header == "DedupGroup":
+                    width = 18
+                elif header == "SourceFile":
+                    width = 36
+                elif header in {"DedupRole", "DedupType", "MatchPercentage", "BirthdateSimilarity", "OverallSimilarity"}:
+                    width = 22
+                elif header == "ConflictReason":
+                    width = 42
+                    self.ws.set_column(col_idx, col_idx, width, duplicate_reason_fmt)
+                    continue
+                else:
+                    width = max(10, min(45, len(str(header)) + 3))
+                self.ws.set_column(col_idx, col_idx, width)
+            self.row = 1
+
+        def write_values(self, values: list[Any], dedup_type: str, is_source: bool) -> None:
+            if self.row > excel_max_data_rows:
+                self._new_sheet()
+            safe = (["" if v is None else str(v) for v in values]
+                    if direct_csv else [_safe_excel_value(v) for v in values])
+            gid = group_id_from_cell(safe[duplicate_group_col])
+            first_row = gid != self.last_group
+            if first_row:
+                self.group_ordinal += 1
+            band_name = group_band(self.group_ordinal)
+            highlight_name = highlight_kind(dedup_type)
+            style_key = (band_name, highlight_name, first_row)
+            displayed = visible_values(safe)
+            self.ws.write_row(self.row, 0, displayed, row_formats[style_key])
+            if not direct_csv:
+                marker_col = visible_export_headers.index('Match Type')
+                self.ws.write(self.row, marker_col, displayed[marker_col], marker_formats[style_key])
+                score_col = visible_export_headers.index('Match Percentage')
+                self.ws.write(self.row, score_col, displayed[score_col], score_formats[style_key])
+                reason_col = visible_export_headers.index('Reason')
+                self.ws.write(self.row, reason_col, displayed[reason_col], reason_formats[style_key])
+                self.ws.set_row(self.row, 23 if is_source else 21)
+            self.last_group = gid
+            self.row += 1
+            self.total += 1
+
+        def finish(self) -> None:
+            self._finish_sheet()
+
+    # Create workbook sheets in the classic Cross Match order:
+    # VALIDATED -> DUPLICATE -> REVIEW. The Summary/Run_Info sheets already
+    # exist before these writers are constructed.
+    validated_writer = SheetWriter("CLEAN")
+    duplicate_writer = GroupedDuplicateWriter()
+    review_writer = SheetWriter("REVIEW")
+    findings_writer = None  # FINDINGS was removed from user-facing exports.
+    expected_findings = 0
+    writers = {
+        "validated": validated_writer,
+        "review": review_writer,
+    }
+
+    conn = sqlite3.connect(a.db_path)
+    _configure_db(conn, options.memory_limit_percent)
+    # Compute duplicate-family order from compact arrays in RAM. Sorting a
+    # SQLite table containing hundreds of thousands of JSON payloads was the
+    # main 500K export bottleneck. The order keys are tiny numeric arrays.
+    duplicate_ids_all = np.flatnonzero(duplicate_mask_all).astype(np.int64, copy=False)
+    if duplicate_ids_all.size:
+        duplicate_group_keys = np.asarray(group_arr[duplicate_ids_all], dtype=np.int64)
+        if b is None:
+            duplicate_source_priority = (source_by_group[duplicate_group_keys] != duplicate_ids_all).astype(np.int8)
+        else:
+            duplicate_source_priority = np.ones(len(duplicate_ids_all), dtype=np.int8)
+        type_priority_lookup = np.full(256, 9, dtype=np.int8)
+        type_priority_lookup[TYPE_TRUE] = 0
+        type_priority_lookup[TYPE_FUZZY] = 1
+        type_priority_lookup[TYPE_TRUE_SWAP] = 2
+        type_priority_lookup[TYPE_FUZZY_SWAP] = 3
+        duplicate_type_priority = type_priority_lookup[np.asarray(type_arr[duplicate_ids_all], dtype=np.uint8)]
+        duplicate_scores_sort = np.asarray(score_arr[duplicate_ids_all], dtype=np.float32)
+        duplicate_order = duplicate_ids_all[np.lexsort((
+            duplicate_ids_all, -duplicate_scores_sort, duplicate_type_priority,
+            duplicate_source_priority, duplicate_group_keys,
+        ))]
+    else:
+        duplicate_order = np.empty(0, dtype=np.int64)
+
+    conn.execute("DROP TABLE IF EXISTS export_duplicate_payload")
+    conn.execute("CREATE TABLE export_duplicate_payload(row_id INTEGER PRIMARY KEY,payload TEXT NOT NULL) WITHOUT ROWID")
+
+    # Cross Match now exports the actual File B reference record as the first row
+    # of every duplicate group. Project File B values into File A's visible
+    # column layout using the same semantic header pairing used by the UI.
+    conn.execute("DROP TABLE IF EXISTS export_cross_reference_payload")
+    conn.execute(
+        "CREATE TABLE export_cross_reference_payload("
+        "group_id INTEGER PRIMARY KEY,payload TEXT NOT NULL) WITHOUT ROWID"
+    )
+
+    if b is not None and cross_reference_rows:
+        pair_map = suggest_cross_header_pairs(a.headers, b.headers, a.mapping, b.mapping)
+        b_to_groups: dict[int, list[int]] = {}
+        for gid in np.flatnonzero(source_b_by_group >= 0):
+            bid = int(source_b_by_group[int(gid)])
+            if bid >= 0:
+                b_to_groups.setdefault(bid, []).append(int(gid))
+
+        wanted_b_ids = np.asarray(sorted(b_to_groups), dtype=np.int64)
+        b_offset = 0
+        b_chunk_rows = adaptive_chunk_rows(options.chunk_rows, options.memory_limit_percent, len(b.headers))
+        if b.raw_is_source and b.raw_csv == b.source_plan.path:
+            b_chunks: Iterable[pd.DataFrame] = iter_input_chunks(b.source_plan, b_chunk_rows)
+        else:
+            b_chunks = pd.read_csv(
+                b.raw_csv, dtype=str, keep_default_na=False, na_filter=False,
+                chunksize=b_chunk_rows, low_memory=False,
+            )
+
+        for b_chunk in b_chunks:
+            n_b = len(b_chunk)
+            lo = int(np.searchsorted(wanted_b_ids, b_offset, side="left"))
+            hi = int(np.searchsorted(wanted_b_ids, b_offset + n_b, side="left"))
+            for bid_raw in wanted_b_ids[lo:hi]:
+                bid = int(bid_raw)
+                local = bid - b_offset
+                if local < 0 or local >= n_b:
+                    continue
+                row_b = b_chunk.iloc[local]
+                projected = _project_cross_reference_row(row_b, a, b, pair_map)
+                for gid in b_to_groups.get(bid, []):
+                    values = projected + [
+                        source_b_label,
+                        f"GROUP-{gid:07d}",
+                        "REFERENCE (FILE B)",
+                        "REFERENCE",
+                        "",
+                        "",
+                        "",
+                        _reference_reason("File B", bid + 1),
+                    ]
+                    if advanced_conn:
+                        ref_metadata=advanced_conn.execute('SELECT payload,death_status,notes FROM b_selected WHERE row_id=?',(bid,)).fetchone()
+                        if ref_metadata is None:
+                            raise RuntimeError(f'Missing advanced File B reference row {bid}.')
+                        raw_b,death_b,note_b=ref_metadata
+                        values += ['REFERENCE','','','', '',death_b,'REFERENCE ONLY',note_b,
+                                   f'File B data row {bid + 1}'] + json.loads(raw_b)
+                    else:
+                        values += [row_b.get(h, '') for h in b.headers]
+                    payload = json.dumps(
+                        [_safe_excel_value(v) for v in values],
+                        ensure_ascii=False,
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO export_cross_reference_payload(group_id,payload) VALUES (?,?)",
+                        (gid, payload),
+                    )
+            b_offset += n_b
+        conn.commit()
+        log(f"Prepared {cross_reference_rows:,} File B reference row(s) for grouped Cross Match export.")
+
+    row_offset = 0
+    # Export uses the same normalized identity repeatedly for score/reason text.
+    # Reuse feature calculations across the whole export instead of rebuilding
+    # phonetic/compact/token forms for each individual row.
+    export_name_feature_cache: dict[str, tuple[str, str, str, tuple[str, ...]]] = {}
+    chunk_rows = adaptive_chunk_rows(options.chunk_rows, options.memory_limit_percent, len(a.headers))
+    if a.raw_is_source and a.raw_csv == a.source_plan.path:
+        export_chunks: Iterable[pd.DataFrame] = iter_input_chunks(a.source_plan, chunk_rows)
+    else:
+        export_chunks = pd.read_csv(
+            a.raw_csv, dtype=str, keep_default_na=False, na_filter=False,
+            chunksize=chunk_rows, low_memory=False,
+        )
+
+    try:
+        for chunk in export_chunks:
+            n = len(chunk)
+            sl = slice(row_offset, row_offset + n)
+            types = np.asarray(type_arr[sl])
+            groups = np.asarray(group_arr[sl])
+            scores = np.asarray(score_arr[sl])
+            matched = np.asarray(matched_arr[sl])
+            row_ids = np.arange(row_offset, row_offset + n)
+            labels = np.array([TYPE_LABELS[int(x)] for x in types], dtype=object)
+            group_text = np.where(groups > 0, np.char.add("GROUP-", np.char.zfill(groups.astype(str), 7)), "")
+            roles = np.full(n, "", dtype=object)
+            dup_local = np.isin(types, [TYPE_TRUE, TYPE_TRUE_SWAP, TYPE_FUZZY, TYPE_FUZZY_SWAP])
+            roles[dup_local] = "MATCH (FILE A)"
+            source_mask = np.zeros(n, dtype=bool)
+            valid_group = dup_local & (groups > 0)
+
+            # Within-file mode uses one File A row as the group reference.
+            # Cross Match gets its reference from File B and therefore every
+            # duplicate File A row remains a MATCH row.
+            if b is None and valid_group.any():
+                positions = np.flatnonzero(valid_group)
+                source_mask[positions] = source_by_group[groups[positions]] == row_ids[positions]
+                roles[source_mask] = "REFERENCE (FILE A)"
+
+            percentages = np.full(n, "", dtype=object)
+            birth_percentages = np.full(n, "", dtype=object)
+            overall_percentages = np.full(n, "", dtype=object)
+            score_positions = np.flatnonzero((scores > 0) & ~source_mask)
+            percentages[score_positions] = [
+                "100%" if abs(float(scores[pos]) - 100) < 0.01 else f"{float(scores[pos]):.1f}%"
+                for pos in score_positions
+            ]
+            reasons = np.full(n, "", dtype=object)
+            for pos in np.flatnonzero(types == TYPE_FINDING):
+                reasons[pos] = _detailed_finding_reason(
+                    chunk.iloc[int(pos)], a.mapping, int(finding_arr[row_offset + pos]),
+                    min_age=options.min_age, max_age=options.max_age,
+                )
+
+            # Build transparent Name + Birthdate + Overall similarity values
+            # against the actual reference row displayed in the group.
+            duplicate_positions = np.flatnonzero(dup_local)
+            if len(duplicate_positions):
+                # v6.24 export accelerator: normalized names/DOB components were
+                # already computed during staging. Fetch them in indexed batches
+                # instead of constructing tiny Pandas Series and normalizing every
+                # duplicate row again during Excel preparation.
+                duplicate_global_ids = row_ids[duplicate_positions].astype(np.int64, copy=False)
+                staged_current_details = _fetch_row_details(
+                    conn, "rows_a", duplicate_global_ids.tolist()
+                )
+                staged_current_birth = _fetch_birth_components(
+                    conn, "rows_a", duplicate_global_ids.tolist()
+                )
+                current_details = {
+                    int(pos): staged_current_details.get(
+                        int(row_ids[int(pos)]), ("", "", "", "", "", "")
+                    )
+                    for pos in duplicate_positions.tolist()
+                }
+
+                def apply_similarity_columns(
+                    pos: int,
+                    ref: tuple[str, str, str, str, str, str],
+                    ref_birth_components: tuple[str, str, str],
+                ) -> None:
+                    dtype_value = int(types[pos])
+                    cur = current_details[pos]
+                    _an, _ab, af, am, al, asu = cur
+                    _bn, _bb, bf, bm, bl, bsu = ref
+                    swap = dtype_value in (TYPE_TRUE_SWAP, TYPE_FUZZY_SWAP)
+                    name_profile = _name_component_profile(
+                        af, am, al, asu, bf, bm, bl, bsu,
+                        swap=swap, feature_cache=export_name_feature_cache,
+                    )
+                    if dtype_value in (TYPE_TRUE, TYPE_TRUE_SWAP):
+                        name_rate = 100.0
+                    else:
+                        name_rate = _profile_rate(name_profile) if name_profile["compared"] else float(scores[pos])
+                        # A suffix conflict is *separate* review evidence; the
+                        # full First/Middle/Last may still be a 100% name match.
+                        if (asu and bsu and _canonical_suffix(asu) != _canonical_suffix(bsu)
+                                and af and al and af == bf and al == bl and am == bm):
+                            name_rate = 100.0
+                        elif (af and bf and af != bf and al and al == bl and am == bm
+                              and asu == bsu and float(fuzz.ratio(af, bf)) >= float(options.fuzzy_threshold)):
+                            # Only permit this extra fuzzy rescue where the
+                            # complete birthdate is also equal (verified below).
+                            dob_a = staged_current_birth.get(int(row_ids[int(pos)]), ("", "", ""))
+                            name_birth_b = ref_birth_components
+                            if (all(dob_a) and all(name_birth_b) and dob_a == name_birth_b):
+                                name_rate = max(name_rate, round((float(fuzz.ratio(af, bf)) + 100.0) / 2.0, 1))
+
+                    current_row_id = int(row_ids[int(pos)])
+                    current_birth_components = staged_current_birth.get(
+                        current_row_id, ("", "", "")
+                    )
+                    birth_profile = _birth_component_profile_from_components(
+                        current_birth_components,
+                        ref_birth_components,
+                    )
+                    birth_rate = (_birth_profile_rate(birth_profile)
+                                  if birth_profile['compared'] == 3 else None)
+                    overall_rate = _overall_similarity(name_rate, birth_rate)
+
+                    # MatchPercentage shows Name; OverallSimilarity controls the threshold.
+                    percentages[pos] = "100%" if abs(name_rate - 100.0) < 0.01 else f"{name_rate:.1f}%"
+                    birth_percentages[pos] = _format_birth_rate(birth_rate)
+                    overall_percentages[pos] = f"{overall_rate:.1f}%"
+                    if b is not None:
+                        reasons[pos] = _simple_cross_match_conflict_reason(
+                            dtype_value,
+                            cur,
+                            ref,
+                            current_birth_components=current_birth_components,
+                            reference_birth_components=ref_birth_components,
+                        )
+                    else:
+                        reasons[pos] = _simple_match_reason(
+                            dtype_value,
+                            float(scores[pos]),
+                            cur,
+                            ref,
+                            current_birth_components=current_birth_components,
+                            reference_birth_components=ref_birth_components,
+                            precomputed_name_profile=name_profile,
+                            precomputed_birth_profile=birth_profile,
+                        )
+
+                if b is not None:
+                    group_ref_b_ids = [
+                        int(source_b_by_group[int(groups[pos])]) if int(groups[pos]) > 0 else int(matched[pos])
+                        for pos in duplicate_positions.tolist()
+                    ]
+                    b_details = _fetch_row_details(conn, "rows_b", group_ref_b_ids)
+                    b_birth_components = _fetch_birth_components(conn, "rows_b", group_ref_b_ids)
+                    for pos, brow in zip(duplicate_positions.tolist(), group_ref_b_ids):
+                        ref = b_details.get(brow, ("File B record", "", "", "", "", ""))
+                        ref_birth = b_birth_components.get(brow, ("", "", ""))
+                        apply_similarity_columns(pos, ref, ref_birth)
+                else:
+                    # Self Dedup stores the best direct fuzzy partner for each
+                    # fuzzy row. Use that pair for MatchPercentage/ConflictReason
+                    # so a transitive family never displays a sub-threshold score
+                    # against a different group reference. Exact rows continue to
+                    # use the single displayed group reference.
+                    reference_ids: list[int] = []
+                    for pos in duplicate_positions.tolist():
+                        gid = int(groups[pos])
+                        source_id = int(source_by_group[gid]) if gid > 0 else -1
+                        dtype_value = int(types[pos])
+                        direct_partner = int(matched[pos])
+                        if dtype_value in (TYPE_FUZZY, TYPE_FUZZY_SWAP) and direct_partner >= 0:
+                            reference_ids.append(direct_partner)
+                        else:
+                            reference_ids.append(source_id)
+                    source_details = _fetch_row_details(conn, "rows_a", reference_ids)
+                    source_birth_components = _fetch_birth_components(conn, "rows_a", reference_ids)
+                    for pos, reference_id in zip(duplicate_positions.tolist(), reference_ids):
+                        gid = int(groups[pos])
+                        source_id = int(source_by_group[gid]) if gid > 0 else -1
+                        if int(row_ids[pos]) == source_id:
+                            reasons[pos] = _reference_reason("File A", source_id + 1)
+                        else:
+                            ref = source_details.get(reference_id, ("reference record", "", "", "", "", ""))
+                            ref_birth = source_birth_components.get(reference_id, ("", "", ""))
+                            apply_similarity_columns(pos, ref, ref_birth)
+                            if int(types[pos]) in (TYPE_FUZZY, TYPE_FUZZY_SWAP) and reference_id != source_id:
+                                reasons[pos] = (str(reasons[pos]) + f" Direct fuzzy partner: File A row {reference_id + 2}.").strip()
+
+            # Defense-in-depth: the classifier already enforces the threshold.
+            # If a future code path ever produces a fuzzy display rate below the
+            # selected threshold, do not silently export it as a valid MATCH.
+            for pos in np.flatnonzero(np.isin(types, [TYPE_FUZZY, TYPE_FUZZY_SWAP]) & ~source_mask):
+                raw_pct = str(percentages[pos] or "").strip().rstrip("%")
+                try:
+                    shown_pct = float(raw_pct)
+                except Exception:
+                    shown_pct = 0.0
+                overall_shown = float(str(overall_percentages[pos] or '0').rstrip('%'))
+                if overall_shown + 1e-9 < float(options.fuzzy_threshold):
+                    raise RuntimeError(
+                        f"Overall threshold integrity error: fuzzy row {row_offset + int(pos) + 2} "
+                        f"shows {overall_shown:.1f}% overall below configured {options.fuzzy_threshold}%."
+                    )
+
+            # Reference rows are real records, but are not pairwise match
+            # decisions themselves. Keep their rate blank and label them clearly.
+            labels[source_mask] = "REFERENCE"
+            percentages[source_mask] = ""
+            birth_percentages[source_mask] = ""
+            overall_percentages[source_mask] = ""
+
+            if b is not None:
+                chunk["SourceFile"] = source_a_label
+            chunk["DedupGroup"] = group_text
+            chunk["DedupRole"] = roles
+            chunk["DedupType"] = labels
+            # MatchPercentage remains the strict NAME similarity used by the
+            # configured fuzzy threshold. Birth/Overall are extra audit scores.
+            chunk["MatchPercentage"] = percentages
+            chunk["BirthdateSimilarity"] = birth_percentages
+            chunk["OverallSimilarity"] = overall_percentages
+            if advanced_conn:
+                from services.advanced_conditions import mapped_header
+                condition_rows={int(rid):(notes,da,db,flag) for rid,notes,da,db,flag in advanced_conn.execute(
+                    'SELECT row_id,notes,death_a,death_b,flag_review FROM flags_a WHERE row_id>=? AND row_id<?',
+                    (row_offset,row_offset+n))}
+                b_lookup={}
+                if b is not None:
+                    wanted=np.unique(matched[dup_local & (matched>=0)]).astype(np.int64)
+                    for start_b in range(0,len(wanted),850):
+                        part=wanted[start_b:start_b+850].tolist()
+                        if part:
+                            placeholders=','.join('?' for _ in part)
+                            for bid,payload,death_b,case_b,dod_b,b_note in advanced_conn.execute(
+                                f'SELECT row_id,payload,death_status,case_status,dod,notes FROM b_selected WHERE row_id IN ({placeholders})',part):
+                                b_lookup[int(bid)]=(json.loads(payload),death_b,b_note)
+                dsh=mapped_header(a.mapping,'death_status')
+                death_a_values = chunk[dsh].fillna('').astype(str).tolist() if dsh in chunk.columns and dsh else ['']*n
+                match_types=[];death_b_values=[];review_flags=[];condition_notes=[];b_raw=[]
+                for pos in range(n):
+                    rid=int(row_ids[pos]); flag=condition_rows.get(rid)
+                    note=flag[0] if flag else ''
+                    db=flag[2] if flag else ''
+                    if not db and int(matched[pos]) in b_lookup:
+                        db=b_lookup[int(matched[pos])][1]
+                    if note:
+                        reasons[pos]=(str(reasons[pos]).strip()+' | '+note).strip(' |')
+                    match_types.append(labels[pos])
+                    death_b_values.append(db)
+                    review_flags.append('YES' if (types[pos]==TYPE_FINDING or flag and flag[3]) else '')
+                    condition_notes.append(note)
+                    b_raw.append(b_lookup.get(int(matched[pos]),([], '', ''))[0] if dup_local[pos] else [])
+                chunk['Match Type']=match_types
+                chunk['Name Similarity %']=percentages
+                chunk['DOB Similarity %']=birth_percentages
+                chunk['Overall Evidence %']=overall_percentages
+                chunk['Death Status A']=death_a_values
+                chunk['Death Status B']=death_b_values
+                chunk['Review Flag']=review_flags
+                chunk['Condition Triggered']=condition_notes
+                chunk['Source Row Reference']=[f'File A data row {rid+1}' for rid in row_ids]
+                for column_index,header_b in enumerate(b_columns):
+                    chunk[header_b]=[rec[column_index] if rec else '' for rec in b_raw]
+                condition_mask=np.fromiter((bool(condition_notes[pos]) or types[pos]==TYPE_FINDING for pos in range(n)),dtype=bool,count=n)
+                expected_findings+=int(np.count_nonzero(condition_mask))
+            chunk["ConflictReason"] = reasons
+            # Internal reference payload includes actual File B source fields
+            # even without Advanced Conditions. These values remain blank
+            # on File A output rows; no reference-data repetition.
+            if b is not None and not advanced_conn:
+                for header_b in b_columns:
+                    chunk[header_b] = ""
+            if findings_writer is not None:
+                findings_writer.write_dataframe_rows(chunk.loc[condition_mask, output_columns])
+            writers["validated"].write_dataframe_rows(chunk.loc[types == TYPE_CLEAN, output_columns])
+            writers["review"].write_dataframe_rows(chunk.loc[types == TYPE_FINDING, output_columns])
+
+            dup_positions = np.flatnonzero(dup_local)
+            if len(dup_positions):
+                spool_rows = []
+                duplicate_frame = chunk.loc[dup_local, duplicate_output_columns]
+                for local_pos, values in zip(dup_positions.tolist(), duplicate_frame.itertuples(index=False, name=None)):
+                    rid = int(row_ids[local_pos])
+                    payload = json.dumps([_safe_excel_value(v) for v in values], ensure_ascii=False)
+                    spool_rows.append((rid, payload))
+                conn.executemany(
+                    "INSERT INTO export_duplicate_payload(row_id,payload) VALUES (?,?)",
+                    spool_rows,
+                )
+
+            row_offset += n
+            if row_offset % max(chunk_rows, 100_000) == 0 or row_offset >= a.rows:
+                conn.commit()
+            log(f"Prepared {row_offset:,}/{a.rows:,} rows for grouped Excel export.")
+    finally:
+        conn.commit()
+
+    log("Writing DUPLICATE RECORDS in grouped reference-first order.")
+    written_matches = 0
+    written_references = 0
+    fetch_batch = DUPLICATE_SPOOL_FETCH_BATCH
+    last_cross_group = -1
+
+    for start_pos in range(0, len(duplicate_order), fetch_batch):
+        batch_ids = duplicate_order[start_pos:start_pos + fetch_batch]
+        placeholders = ",".join("?" for _ in batch_ids)
+        payload_map = {
+            int(row_id): payload
+            for row_id, payload in conn.execute(
+                f"SELECT row_id,payload FROM export_duplicate_payload WHERE row_id IN ({placeholders})",
+                [int(x) for x in batch_ids],
+            )
+        }
+
+        for rid_raw in batch_ids:
+            rid = int(rid_raw)
+            gid = int(group_arr[rid])
+
+            # Cross Match: insert the actual File B master/reference record once,
+            # then place all matching File A records immediately below it.
+            if b is not None and gid > 0 and gid != last_cross_group:
+                ref_row = conn.execute(
+                    "SELECT payload FROM export_cross_reference_payload WHERE group_id=?",
+                    (gid,),
+                ).fetchone()
+                if ref_row is None:
+                    raise RuntimeError(f"Cross Match reference payload missing for group {gid}.")
+                ref_values = json.loads(ref_row[0])
+                duplicate_writer.write_values(ref_values, "REFERENCE", True)
+                written_references += 1
+                last_cross_group = gid
+
+            payload = payload_map.get(rid)
+            if payload is None:
+                raise RuntimeError(f"Duplicate export payload missing for File A row {rid + 2}.")
+            values = json.loads(payload)
+            type_code = int(type_arr[rid])
+
+            if b is None:
+                is_source = bool(gid > 0 and source_by_group[gid] == rid)
+            else:
+                is_source = False
+
+            duplicate_writer.write_values(values, TYPE_LABELS[type_code], is_source)
+            if not is_source:
+                written_matches += 1
+            else:
+                written_references += 1
+
+        if written_matches % 100_000 < len(batch_ids) or written_matches == counts["Duplicate Records"]:
+            log(
+                f"Grouped duplicate export: {written_matches:,} match row(s), "
+                f"{written_references:,} reference row(s)."
+            )
+
+    duplicate_writer.finish()
+
+    # Hard no-loss export verification. Classification integrity confirms every
+    # File A row belongs to exactly one result class. These writer counters then
+    # prove that every classified row was actually emitted to the workbook.
+    expected_validated = counts["Validated Records"]
+    expected_review = counts["Records for Review"]
+    expected_duplicate_sheet = duplicate_sheet_total_rows
+    export_integrity = (
+        validated_writer.total == expected_validated
+        and review_writer.total == expected_review
+        and duplicate_writer.total == expected_duplicate_sheet
+        and (findings_writer is None or findings_writer.total == expected_findings)
+    )
+    if not export_integrity:
+        # Close and remove the partial workbook before failing. Never leave a
+        # corrupt/incomplete result looking like a valid completed export.
+        try:
+            conn.commit()
+            conn.close()
+        finally:
+            try:
+                workbook.close()
+            finally:
+                partial_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            "Export integrity failure: result rows would be incomplete. "
+            f"Validated {validated_writer.total:,}/{expected_validated:,}; "
+            f"Review {review_writer.total:,}/{expected_review:,}; "
+            f"Duplicate sheet {duplicate_writer.total:,}/{expected_duplicate_sheet:,}. "
+            "No incomplete workbook was promoted to the final output."
+        )
+    log(
+        "No-loss export integrity PASS: "
+        f"Validated={validated_writer.total:,}; "
+        f"Duplicate-sheet rows={duplicate_writer.total:,}; "
+        f"Review={review_writer.total:,}."
+    )
+
+    conn.execute("DROP TABLE IF EXISTS export_duplicate_payload")
+    conn.execute("DROP TABLE IF EXISTS export_cross_reference_payload")
+    conn.commit()
+    conn.close()
+    if advanced_conn:
+        advanced_conn.close()
+
+    # Keep Maximum Recall candidate classification; do not export a redundant pair sheet.
+    all_pair_count = 0 if options.exhaustive else None
+    workbook.close()
+    if direct_csv:
+        os.replace(partial_path, output_path)
+        actual_output_path, used_alternate_output = output_path, False
+        log(f"Direct CSV ZIP saved: {actual_output_path}")
+    else:
+        actual_output_path, used_alternate_output = _finalize_excel_output(
+            partial_path, output_path, log
+        )
+        log(f"Excel workbook saved: {actual_output_path}")
+    return {
+        "paths": {"csv_zip" if direct_csv else "workbook": str(actual_output_path)},
+        "requested_output": str(output_path),
+        "used_alternate_output": bool(used_alternate_output),
+        "all_match_pairs": all_pair_count,
+        "matching_coverage": "exhaustive eligible pairs" if options.exhaustive and options.fuzzy else "exact only" if not options.fuzzy else "indexed candidates",
+        "counts": counts,
+        "review_reason_counts": review_reason_counts,
+        "integrity_check": integrity,
+        "export_integrity_check": True,
+        "export_sheet_parts": {
+            "validated": int(validated_writer.part),
+            "duplicate": int(duplicate_writer.part),
+            "review": int(review_writer.part),
+            "findings": int(findings_writer.part) if findings_writer else 0,
+        },
+        "zip64_enabled": True,
+        "export_format": "csv_zip" if direct_csv else "xlsx",
+        "large_export_mode": bool(large_export_mode),
+        "no_loss_output": True,
+    }
+
+def run_engine(
+    file_a: str,
+    file_b: str | None = None,
+    sheet_a: str | None = None,
+    sheet_b: str | None = None,
+    mapping_a_path: str | None = None,
+    mapping_b_path: str | None = None,
+    options: ScaleOptions | None = None,
+    log: LogFn = default_log,
+) -> dict[str, Any]:
+    options = options or ScaleOptions()
+    # Apply the same safety validation to GUI, CLI, and direct Python calls.
+    options.fuzzy_threshold = max(MIN_DEDUP_FUZZY_THRESHOLD, min(100, int(options.fuzzy_threshold)))
+    options.min_age = max(0, min(200, int(options.min_age)))
+    options.max_age = max(0, min(200, int(options.max_age)))
+    if options.min_age > 0 and options.max_age > 0 and options.min_age >= options.max_age:
+        raise ValueError("Under age must be lower than Too old. Use 0 to disable either age limit.")
+    options.memory_limit_percent = max(25, min(95, int(options.memory_limit_percent)))
+    started = time.perf_counter()
+    plan_a = inspect_input(file_a, sheet_a)
+    mapping_a = load_mapping(mapping_a_path, plan_a.headers)
+    if not mapping_a.has_name() and not mapping_a.has_exact():
+        raise RuntimeError("File A needs mapped Name fields or an explicit unique ID. Birthdate alone is not safe for deduplication.")
+    plan_b = None; mapping_b = None
+    if options.mode == MODE_CROSS:
+        if not file_b: raise ValueError("Cross Match requires File B.")
+        plan_b = inspect_input(file_b, sheet_b)
+        mapping_b = load_mapping(mapping_b_path, plan_b.headers)
+        if not mapping_b.has_name() and not mapping_b.has_exact():
+            raise RuntimeError("File B needs mapped Name fields or an explicit unique ID. Birthdate alone is not safe for deduplication.")
+        cross_notes = reconcile_cross_identity_mappings(mapping_a, mapping_b)
+        options.cross_mapping_notes = "; ".join(cross_notes) if cross_notes else "Core identity mappings already semantically consistent"
+        if cross_notes:
+            log("Cross mapping preflight auto-synchronized identity policy: " + " | ".join(cross_notes))
+        else:
+            log("Cross mapping preflight: File A/File B core identity policy already consistent.")
+
+    output_folder = Path(options.output_folder or Path(file_a).resolve().parent).expanduser().resolve()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = "DEDUP_500K_1M_FUZZY_SWAP_" + stamp if options.mode == MODE_FILE_A else "CROSS_500K_1M_FUZZY_SWAP_" + stamp
+    temp_parent = output_folder / f".{run_name}_TEMP"
+    temp_parent.mkdir(parents=True, exist_ok=True)
+    log(f"Temporary workspace: {temp_parent}")
+    log(f"File A mapping: {json.dumps(mapping_a.to_json(), ensure_ascii=False)}")
+    if mapping_b: log(f"File B mapping: {json.dumps(mapping_b.to_json(), ensure_ascii=False)}")
+    log(
+        f"CPU workers: {options.workers()}; TRUE_SWAP={options.enable_swap}; FUZZY/FUZZY_SWAP={options.fuzzy}; "
+        f"threshold={options.fuzzy_threshold}; "
+        f"birth-year window={'NONE' if int(options.fuzzy_birth_year_window)<0 else '±'+str(int(options.fuzzy_birth_year_window))}; "
+        f"candidate cap={'NONE' if int(options.fuzzy_max_candidates)<=0 else int(options.fuzzy_max_candidates)}; "
+        f"block cap={'NONE' if int(options.fuzzy_block_limit)<=0 else int(options.fuzzy_block_limit)}; "
+        f"memory target={options.memory_limit_percent}%; DEVICE/PROCESS MODE=MAXIMUM."
+    )
+
+    try:
+        # v6.32.1 accelerated Excel conversion: XML-stream the selected sheet
+        # into a temporary CSV once. The original XLSX and input mapping remain
+        # unchanged. Any unsupported workbook transparently uses OpenPyXL.
+        if os.getenv("CROSSMATCH_FAST_EXCEL", "1").strip() != "0":
+            for side, plan in (("a", plan_a), ("b", plan_b)):
+                if plan is None or plan.path.suffix.casefold() not in {".xlsx", ".xlsm"}:
+                    continue
+                cached = temp_parent / f"fast_excel_{side}.csv"
+                log(f"Fast Excel conversion File {side.upper()}: streaming the selected worksheet to temporary CSV...")
+                try:
+                    from services.fast_excel import convert_xlsx_to_csv
+                    converted_rows, convert_seconds = convert_xlsx_to_csv(plan, cached, log)
+                    plan.accelerated_csv = cached
+                    log(f"Fast Excel conversion File {side.upper()}: {converted_rows:,} rows in {convert_seconds:.2f}s; using CSV matching and export.")
+                except Exception as exc:
+                    cached.unlink(missing_ok=True)
+                    log(f"Fast Excel conversion File {side.upper()}: compatibility fallback to OpenPyXL ({type(exc).__name__}).")
+        stage_a = stage_input(plan_a, mapping_a, "a", temp_parent, options, log, apply_finding=True)
+        stage_b = None
+        if options.mode == MODE_CROSS and plan_b and mapping_b:
+            # Both sides share one SQLite database. Stage B after A.
+            stage_b = stage_input(plan_b, mapping_b, "b", temp_parent, options, log, apply_finding=False)
+        if options.mode == MODE_FILE_A:
+            class_paths = classify_within(stage_a, options, temp_parent, log)
+        else:
+            assert stage_b is not None
+            class_paths = classify_cross(stage_a, stage_b, options, temp_parent, log)
+        condition_stats = None
+        if options.advanced_conditions is not None:
+            from services.advanced_conditions import apply_conditions
+            log("Condition evaluation: identity matching completed; checking enabled review rules.")
+            condition_stats = apply_conditions(stage_a, stage_b, class_paths,
+                options.advanced_conditions, options, log, temp_parent)
+            options.enrichment_path = condition_stats["db"]
+        result = export_results(stage_a, stage_b, class_paths, options, output_folder, run_name, log)
+        if condition_stats:
+            result["advanced_conditions"] = {k:v for k,v in condition_stats.items() if k != "db"}
+        result["elapsed_seconds"] = time.perf_counter() - started
+        result["temp_folder"] = str(temp_parent)
+        log(f"Completed in {result['elapsed_seconds'] / 60:.2f} minutes. Integrity check: {result['integrity_check']}.")
+        return result
+    finally:
+        if not options.keep_temp:
+            import shutil
+            try:
+                shutil.rmtree(temp_parent, ignore_errors=True)
+            except Exception:
+                pass
+
+
+def write_mapping_template(input_path: str, output_path: str, sheet: str | None = None) -> str:
+    plan = inspect_input(input_path, sheet)
+    mapping = auto_mapping(plan.headers)
+    payload = mapping.to_json()
+    payload["_detected_headers"] = plan.headers
+    Path(output_path).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return output_path
